@@ -194,6 +194,17 @@ Requires: Docker with the Compose plugin, and an existing host Claude Code login
 - Claude Code's *own* inner bash-sandbox is disabled in `~/.claude-sandbox/settings.json`
   (`sandbox.enabled: false`), because the container is the real isolation boundary and
   running both layers was redundant and caused spurious approval gates.
+- `--dangerously-skip-permissions` does **not** bypass everything: Claude Code has
+  several built-in, hardcoded checks that survive it — a heuristic that always asks
+  before `awk`/`perl`/regex-addressed `sed` (any general text-processing tool capable
+  of in-place edits), a shell-AST hook that blocks unquoted `$var`/`$(...)` expansions
+  in constructs like `for` loops (`Contains simple_expansion`), and first-use
+  network-domain approval. A bare `Bash(*)` allow rule is special-cased and suppresses
+  all of these (verified empirically — narrower rules like `Bash(sed:*)` or
+  `Bash(for *)` do **not**). `csandbox` seeds `permissions.allow: ["Bash(*)"]` into
+  `~/.claude-sandbox/settings.json` automatically on every launch. This is safe here
+  specifically because the Docker layer, not Claude's permission engine, is the actual
+  security boundary.
 - A fresh `npm install` from GitHub Packages won't work in-sandbox: the auth token
   lives in the host `~/.npmrc`, which is intentionally not mounted. Install on the
   host first, or provide the token explicitly (which reopens authenticated GitHub

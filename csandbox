@@ -118,6 +118,32 @@ if not d.get('hasCompletedOnboarding'):
         json.dump(d, f)
 EOF
 
+# Claude's own permission engine has several built-in, hardcoded checks that
+# survive --dangerously-skip-permissions: a heuristic that always asks before
+# awk/perl/regex-addressed sed (any general text-processing tool capable of
+# in-place edits), a shell-AST hook that blocks unquoted $var/$(...)
+# expansions in constructs like for-loops ("Contains simple_expansion"), and
+# a first-use network-domain approval. A bare `Bash(*)` allow rule is treated
+# specially and suppresses all of these (verified empirically - narrower
+# rules like `Bash(sed:*)` or `Bash(for *)` do NOT). This is safe here
+# specifically because the Docker layer - not this permission engine - is
+# the actual security boundary (see docker-compose.yml / egress-proxy):
+# non-root, no docker socket, network allowlisted, secrets shadowed.
+python3 - "$CONFIG_DIR/settings.json" <<'EOF'
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        d = json.load(f)
+except FileNotFoundError:
+    d = {}
+allow = d.setdefault('permissions', {}).setdefault('allow', [])
+if 'Bash(*)' not in allow:
+    allow.append('Bash(*)')
+    with open(path, 'w') as f:
+        json.dump(d, f, indent=2)
+EOF
+
 # git identity for commits made inside the sandbox
 EXTRA_MOUNTS=()
 if [ -f "$HOME/.gitconfig" ]; then
