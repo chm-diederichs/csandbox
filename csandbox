@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+#
+# csandbox [project-dir] [claude args...]
+#
+# Default launcher for running Claude Code with --dangerously-skip-permissions
+# inside a hardened Docker Compose sandbox:
+#   - the sandbox container has NO direct route to the internet; all egress
+#     must pass through the `proxy` sidecar, which only allows connections to
+#     an explicit domain allowlist (everything else gets a 403)
+#   - runs as the non-root `node` user (uid 1000), no added capabilities
+#   - the docker socket is never mounted
+#   - known secret-shaped files under the mounted root are shadowed with an
+#     empty read-only file inside the container (host files are untouched)
+#
+# EGRESS ALLOWLIST
+#   The allowlist is built from three layers, unioned and deduped:
+#     1. base        - api.anthropic.com (always; Claude needs it) plus the
+#                      domains of the selected profile(s)
+#     2. CSANDBOX_PROFILE - one or more comma-separated profiles (default:
+#                      "minimal"). Available profiles:
+#                        minimal - (nothing beyond the base)
+#                        node    - registry.npmjs.org, registry.yarnpkg.com
+#                        git     - github.com, codeload.github.com,
+#                                  raw.githubusercontent.com,
+#                                  objects.githubusercontent.com,
+#                                  gist.githubusercontent.com
+#                        python  - pypi.org, files.pythonhosted.org
+#                        dev     - node + git + python (general coding)
+#     3. CSANDBOX_EXTRA_DOMAINS - comma-separated one-off additions
+#
+#   The default is intentionally minimal: api.anthropic.com only. That host
+#   is single-tenant Anthropic space (not a shared CDN), so it is not a
+#   domain-fronting substrate. npm/github/pypi live on shared CDNs
+#   (Cloudflare/Fastly) which a hostname-only proxy cannot front-proof, so
+#   they are opt-in per workflow rather than always-on.
+#
+#   The resolved allowlist is printed at launch, and any hosts blocked
+#   during the session are reported on exit so you know what to add.
+#
+# Examples:
+#   csandbox                                     # sandbox cwd, minimal egress
+#   csandbox ~/code/myapp
+#   csandbox . --continue                        # extra args go to claude
+#   CSANDBOX_PROFILE=dev csandbox .              # allow npm + git + pypi
+#   CSANDBOX_PROFILE=node,git csandbox .         # combine profiles
+#   CSANDBOX_EXTRA_DOMAINS=example.com csandbox . # one-off host
+#   CSANDBOX_ROOT=~/src csandbox .               # custom workspace root
+#   CSANDBOX_READONLY=1 csandbox .               # mount workspace read-only
+#   CSANDBOX_SHELL=1 csandbox .                  # drop into bash, not claude
+#   CSANDBOX_DRYRUN=1 csandbox .                 # print resolved config & exit
+#   CSANDBOX_DOWN=1 csandbox                     # stop the proxy sidecar & exit
+
+set -euo pipefail
+
+SANDBOX_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+COMPOSE_FILE="$SANDBOX_DIR/docker-compose.yml"
+COMPOSE_PROJECT=claude-sandbox
+compose() { docker compose -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" "$@"; }
+
+# teardown shortcut
+if [ "${CSANDBOX_DOWN:-}" = "1" ]; then
+  compose down
+  exit 0
+fi
+
+# first arg is the project dir if it's a directory, otherwise default to cwd
+if [ $# -gt 0 ] && [ -d "$1" ]; then
+  PROJECT_DIR="$(realpath "$1")"
+  shift
+else
+  PROJECT_DIR="$PWD"
+fi
+
+# workspace root: explicit override > ~/hyper (if the project is inside it,
+# so cross-repo npm links resolve) > the project dir itself
+if [ -n "${CSANDBOX_ROOT:-}" ]; then
+  ROOT="$(realpath "$CSANDBOX_ROOT")"
+elif [[ "$PROJECT_DIR" == "$HOME/hyper/"* ]]; then
+  ROOT="$HOME/hyper"
+else
+  ROOT="$PROJECT_DIR"
+fi
+
+case "$PROJECT_DIR" in
+  "$ROOT" | "$ROOT"/*) ;;
+  *)
+    echo "error: project dir $PROJECT_DIR is not inside workspace root $ROOT" >&2
+    exit 1
+    ;;
+esac
+
+CONFIG_DIR="$HOME/.claude-sandbox"
+mkdir -p "$CONFIG_DIR"
+
+# seed sandbox credentials from the host once, so no re-login is needed
+if [ ! -f "$CONFIG_DIR/.credentials.json" ] && [ -f "$HOME/.claude/.credentials.json" ]; then
+  cp "$HOME/.claude/.credentials.json" "$CONFIG_DIR/.credentials.json"
+  chmod 600 "$CONFIG_DIR/.credentials.json"
+  echo "seeded credentials from ~/.claude into ~/.claude-sandbox"
+fi
+
+# a fresh container generates its own .claude.json (own machineID/userID)
+# with hasCompletedOnboarding unset, which makes the interactive TUI show
+# the first-run setup wizard (including a login step) despite valid
+# credentials already being present. Force it past that gate every launch.
+python3 - "$CONFIG_DIR/.claude.json" <<'EOF'
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        d = json.load(f)
+except FileNotFoundError:
+    d = {}
+if not d.get('hasCompletedOnboarding'):
+    d['hasCompletedOnboarding'] = True
+    d.setdefault('lastOnboardingVersion', '0.0.0')
+    with open(path, 'w') as f:
+        json.dump(d, f)
+EOF
+
+# git identity for commits made inside the sandbox
+EXTRA_MOUNTS=()
+if [ -f "$HOME/.gitconfig" ]; then
+  EXTRA_MOUNTS+=(-v "$HOME/.gitconfig:/home/node/.gitconfig:ro")
+fi
+
+# --- secret scrubbing -------------------------------------------------
+# Shadow known secret-shaped files under the mounted root with an empty
+# read-only file inside the container. The host files are never touched -
+# this only affects what the container sees.
+SECRET_PATTERNS=(
+  '.env' '.env.*' '*.pem' '*.key' '*.p12' '*.pfx' '*.keystore'
+  'id_rsa' 'id_rsa.*' 'id_ed25519' 'id_ed25519.*' 'id_ecdsa' 'id_ecdsa.*'
+  'credentials' 'credentials.json' '.npmrc' '.netrc' '.git-credentials'
+  '.pypirc' 'service-account*.json'
+)
+FIND_NAME_ARGS=()
+for i in "${!SECRET_PATTERNS[@]}"; do
+  [ "$i" -gt 0 ] && FIND_NAME_ARGS+=(-o)
+  FIND_NAME_ARGS+=(-name "${SECRET_PATTERNS[$i]}")
+done
+
+SCRUB_COUNT=0
+while IFS= read -r -d '' f; do
+  EXTRA_MOUNTS+=(-v "/dev/null:$f:ro")
+  SCRUB_COUNT=$((SCRUB_COUNT + 1))
+done < <(find "$ROOT" \
+  \( -path '*/node_modules/*' -o -path '*/.git/*' \) -prune -o \
+  -type f \( "${FIND_NAME_ARGS[@]}" \) -print0 2>/dev/null)
+
+# --- egress allowlist ---------------------------------------------------
+profile_domains() {
+  case "$1" in
+    minimal) ;;
+    node)    echo "registry.npmjs.org registry.yarnpkg.com" ;;
+    git)     echo "github.com codeload.github.com raw.githubusercontent.com objects.githubusercontent.com gist.githubusercontent.com" ;;
+    python)  echo "pypi.org files.pythonhosted.org" ;;
+    dev)     echo "$(profile_domains node) $(profile_domains git) $(profile_domains python)" ;;
+    *)       echo "__UNKNOWN__:$1" ;;
+  esac
+}
+
+DOMAIN_SET=("api.anthropic.com")   # base: always present
+IFS=',' read -ra PROFILES <<< "${CSANDBOX_PROFILE:-minimal}"
+for p in "${PROFILES[@]}"; do
+  p="$(echo "$p" | tr -d '[:space:]')"
+  [ -z "$p" ] && continue
+  for d in $(profile_domains "$p"); do
+    if [[ "$d" == __UNKNOWN__:* ]]; then
+      echo "error: unknown profile '${d#__UNKNOWN__:}' (valid: minimal node git python dev)" >&2
+      exit 1
+    fi
+    DOMAIN_SET+=("$d")
+  done
+done
+if [ -n "${CSANDBOX_EXTRA_DOMAINS:-}" ]; then
+  IFS=',' read -ra EXTRA <<< "$CSANDBOX_EXTRA_DOMAINS"
+  for d in "${EXTRA[@]}"; do
+    d="$(echo "$d" | tr -d '[:space:]')"
+    [ -n "$d" ] && DOMAIN_SET+=("$d")
+  done
+fi
+# dedupe, preserving order
+ALLOWED_DOMAINS="$(printf '%s\n' "${DOMAIN_SET[@]}" | awk '!seen[$0]++' | paste -sd, -)"
+export ALLOWED_DOMAINS
+
+# --- workspace mount mode ------------------------------------------------
+WORKSPACE_MOUNT="$ROOT:$ROOT"
+MOUNT_NOTE="read-write"
+if [ "${CSANDBOX_READONLY:-}" = "1" ]; then
+  WORKSPACE_MOUNT="$ROOT:$ROOT:ro"
+  MOUNT_NOTE="read-only"
+fi
+
+if [ "${CSANDBOX_SHELL:-}" = "1" ]; then
+  CMD=(bash)
+else
+  CMD=(claude --dangerously-skip-permissions "$@")
+fi
+
+# --- launch -------------------------------------------------------------
+echo "csandbox: mount $ROOT ($MOUNT_NOTE), $SCRUB_COUNT secret file(s) shadowed"
+echo "csandbox: egress allowlist -> $ALLOWED_DOMAINS"
+
+# dry run: show resolved config and stop before touching docker
+if [ "${CSANDBOX_DRYRUN:-}" = "1" ]; then
+  echo "csandbox: workdir $PROJECT_DIR"
+  echo "csandbox: (dry run, not launching)"
+  exit 0
+fi
+
+# build images quietly (only rebuilds on change; fast when cached)
+compose build --quiet 2>/dev/null || compose build
+
+# (re)create the proxy with the current allowlist (compose recreates it when
+# ALLOWED_DOMAINS differs from the running instance)
+compose up -d proxy >/dev/null 2>&1
+SINCE="$(date -u +%Y-%m-%dT%H:%M:%S)"
+
+set +e
+compose run --rm \
+  -v "$WORKSPACE_MOUNT" \
+  -v "$CONFIG_DIR:/home/node/.claude" \
+  "${EXTRA_MOUNTS[@]}" \
+  -w "$PROJECT_DIR" \
+  sandbox \
+  "${CMD[@]}"
+RC=$?
+set -e
+
+# report any hosts blocked during this session so the user knows what to add
+BLOCKED="$(compose logs proxy --since "$SINCE" 2>/dev/null \
+  | grep -oE 'DENY [^:]+:' | sed 's/DENY //; s/:$//' | sort -u | paste -sd, - || true)"
+if [ -n "$BLOCKED" ]; then
+  echo "csandbox: blocked egress this session -> $BLOCKED"
+  echo "csandbox: to allow, re-run with CSANDBOX_EXTRA_DOMAINS=$BLOCKED (or a profile)"
+fi
+
+exit $RC

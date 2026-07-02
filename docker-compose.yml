@@ -1,0 +1,34 @@
+services:
+  proxy:
+    build: ./egress-proxy
+    networks:
+      - internal
+      - egress
+    environment:
+      - ALLOWED_DOMAINS=${ALLOWED_DOMAINS}
+    restart: unless-stopped
+
+  sandbox:
+    build: .
+    networks:
+      - internal
+    depends_on:
+      - proxy
+    environment:
+      - HTTP_PROXY=http://proxy:8888
+      - HTTPS_PROXY=http://proxy:8888
+      - NO_PROXY=localhost,127.0.0.1
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 8192
+    mem_limit: 16g
+    stdin_open: true
+    tty: true
+
+networks:
+  # no external route: the only way out is through the proxy service, which
+  # is the sole member of both networks.
+  internal:
+    internal: true
+  egress:
+    driver: bridge
