@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+#
+# wt-hydrate [dir]   (default: $PWD)
+#
+# Cheaply give a git worktree its own node_modules by cloning them from the
+# repo's MAIN worktree - copy-on-write (reflink) where the filesystem supports
+# it, a plain recursive copy otherwise. Never touches the network, so parallel
+# worktree agents don't each need npm egress. Idempotent: skips any
+# node_modules that already exists. Monorepo-aware: mirrors node_modules at
+# every level the main worktree has one (repo root and each workspace package).
+#
+# On a CoW filesystem (btrfs, xfs w/ reflink, zfs) this is near-instant and the
+# clones stay cheap until something writes into them. On ext4 etc. it degrades
+# to a full recursive copy; if that's too slow/large for your fleet, switch the
+# repo to pnpm with a shared store and hydrate with `pnpm install --offline`.
+set -uo pipefail
+
+TARGET="${1:-$PWD}"
+cd "$TARGET" 2>/dev/null || exit 0
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 0
+
+HERE="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+MAIN="$(git worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')"
+[ -n "$MAIN" ] || exit 0
+[ "$HERE" != "$MAIN" ] || exit 0          # this IS the main worktree; nothing to mirror
+
+clone() {  # clone <src-dir> <dst-dir>
+  cp -a --reflink=auto "$1" "$2" 2>/dev/null && return 0
+  cp -a "$1" "$2"                          # fallback for non-GNU cp / odd edge cases
+}
+
+count=0
+while IFS= read -r src; do
+  rel="${src#"$MAIN"/}"
+  dst="$HERE/$rel"
+  [ -e "$dst" ] && continue                # already hydrated
+  mkdir -p "$(dirname "$dst")"
+  if clone "$src" "$dst"; then
+    count=$((count + 1))
+    echo "wt-hydrate: $rel" >&2
+  else
+    echo "wt-hydrate: failed to clone $rel" >&2
+  fi
+done < <(find "$MAIN" -name .git -prune -o -type d -name node_modules -prune -print 2>/dev/null)
+
+[ "$count" -gt 0 ] && echo "wt-hydrate: hydrated $count node_modules dir(s) into $HERE" >&2
+exit 0

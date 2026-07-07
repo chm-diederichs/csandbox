@@ -131,6 +131,9 @@ claude-sandbox/
 ├── csandbox             # the launcher (symlinked into ~/.local/bin)
 ├── Dockerfile           # the sandbox image (node + build tools + claude code)
 ├── docker-compose.yml   # wires the sandbox + proxy + internal/egress networks
+├── git-hooks/
+│   ├── post-checkout   # fires on `git worktree add`; auto-hydrates node_modules
+│   └── wt-hydrate      # clones node_modules from the main worktree (CoW), offline
 └── egress-proxy/
     ├── Dockerfile       # tiny node:alpine image for the proxy
     └── proxy.js         # allowlist-enforcing forward proxy (no deps)
@@ -145,6 +148,28 @@ host, mounted at `/home/node/scratch` in the container. A seeded global
 `CLAUDE.md` points the agent there instead of at project `.claude/` dirs, whose
 writes always trigger Claude Code's hardcoded self-config approval prompt (it
 survives even `--dangerously-skip-permissions` + `Bash(*)`).
+
+---
+
+## Parallel worktree agents
+
+The top-level agent can fan out to many subagents in parallel, each in its own
+git worktree (`Agent(isolation: "worktree")`), all inside the one container.
+Worktrees don't inherit `node_modules` (it's gitignored), but the parallel phase
+should be **network-quiet** — no subagent should hit the npm registry.
+
+So a system-wide `post-checkout` git hook (`git-hooks/`, installed via
+`core.hooksPath` in the image) fires whenever a worktree is created and clones
+`node_modules` from the repo's main worktree — copy-on-write where the host fs
+supports it, offline always. It's guarded to run only on worktree creation (null
+prev-SHA in a linked worktree), is idempotent, and is monorepo-aware (mirrors
+`node_modules` at the repo root and each workspace package). Verified to fire on
+the Agent tool's own worktree creation.
+
+The one case that still needs the network is a subagent **adding a new
+dependency** — that's a registry fetch, so it surfaces at the egress proxy
+rather than happening silently. Keep the parallel phase to work that uses the
+already-installed deps.
 
 ---
 
