@@ -207,21 +207,34 @@ with `CSANDBOX_EXTRA_DOMAINS=claude.ai csandbox .` then `/login` inside.
 - The default mount root is all of `~/hyper` (when the project is under it) so that
   cross-repo npm links resolve — e.g. `keet-core-hyperdb` uses a locally-linked
   `brittle` fork at `~/hyper/brittle`. That also means `~/hyper` is the blast radius;
-  use `CSANDBOX_ROOT` to narrow it for a one-off.
+  use `CSANDBOX_ROOT` to narrow it for a one-off. The mount root is also seeded into
+  `permissions.additionalDirectories` each launch, so reads/edits of sibling files
+  inside the mount but outside the project dir don't trip the "outside working
+  directory" trust prompt (Claude otherwise only trusts its launch dir).
 - Claude Code's *own* inner bash-sandbox is disabled in `~/.claude-sandbox/settings.json`
   (`sandbox.enabled: false`), because the container is the real isolation boundary and
   running both layers was redundant and caused spurious approval gates.
-- `--dangerously-skip-permissions` does **not** bypass everything: Claude Code has
-  several built-in, hardcoded checks that survive it — a heuristic that always asks
-  before `awk`/`perl`/regex-addressed `sed` (any general text-processing tool capable
-  of in-place edits), a shell-AST hook that blocks unquoted `$var`/`$(...)` expansions
-  in constructs like `for` loops (`Contains simple_expansion`), and first-use
-  network-domain approval. A bare `Bash(*)` allow rule is special-cased and suppresses
-  all of these (verified empirically — narrower rules like `Bash(sed:*)` or
-  `Bash(for *)` do **not**). `csandbox` seeds `permissions.allow: ["Bash(*)"]` into
-  `~/.claude-sandbox/settings.json` automatically on every launch. This is safe here
-  specifically because the Docker layer, not Claude's permission engine, is the actual
+- **Why not `bypassPermissions`?** This account carries an org-managed remote
+  setting — `permissions.disableBypassPermissionsMode: "disable"` in
+  `~/.claude-sandbox/remote-settings.json`, fetched from Anthropic's server — that
+  disables bypass mode account-wide. `--dangerously-skip-permissions` and
+  `defaultMode: bypassPermissions` are therefore refused, and Claude falls back to
+  `default` mode. The policy can't be stripped from inside the sandbox: it rides the
+  same `api.anthropic.com` connection Claude needs, and managed/remote settings
+  outrank every local override by design.
+- **How prompts are eliminated instead.** In `default` mode a *bare* tool-name allow
+  rule auto-approves every use of that tool, so `csandbox` seeds
+  `permissions.allow: ["Bash(*)", "Edit", "Write", "WebFetch", "NotebookEdit"]` on
+  every launch. `Bash(*)` additionally suppresses Claude's built-in text-processing
+  (`awk`/`perl`/`sed`) and shell-expansion heuristics. Read-only tools never prompt.
+  This is safe because the Docker layer, not the permission engine, is the actual
   security boundary.
+- **Residual prompts that survive even this** (they only relax in true bypass mode,
+  which is unavailable here): writes under protected dirs — `.claude`, `.git`,
+  `.vscode`, etc. — and the `rm -rf /` / `rm -rf ~` circuit breakers. The protected-dir
+  guard is why the agent gets a scratch dir and a `CLAUDE.md` steering it away from
+  project `.claude/` dirs (see [File layout](#file-layout)); without bypass mode there
+  is no rule that makes those writes prompt-free.
 - A fresh `npm install` from GitHub Packages won't work in-sandbox: the auth token
   lives in the host `~/.npmrc`, which is intentionally not mounted. Install on the
   host first, or provide the token explicitly (which reopens authenticated GitHub
