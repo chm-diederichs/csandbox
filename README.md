@@ -63,7 +63,9 @@ for everything else.
 
 The allowlist is built from three layers, unioned and deduplicated:
 
-1. **base** — `api.anthropic.com`, always present (Claude needs it). It's
+1. **base** — `api.anthropic.com` (inference) and `platform.claude.com`
+   (OAuth token refresh — without it the login dies when the access token
+   expires, a few hours in), always present. `api.anthropic.com` is
    single-tenant Anthropic space, not a shared CDN, so it is not a
    domain-fronting substrate.
 2. **`CSANDBOX_PROFILE`** — one or more comma-separated profiles (default `minimal`).

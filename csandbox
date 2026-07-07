@@ -14,8 +14,9 @@
 #
 # EGRESS ALLOWLIST
 #   The allowlist is built from three layers, unioned and deduped:
-#     1. base        - api.anthropic.com (always; Claude needs it) plus the
-#                      domains of the selected profile(s)
+#     1. base        - api.anthropic.com + platform.claude.com (always;
+#                      inference + OAuth token refresh) plus the domains of
+#                      the selected profile(s)
 #     2. CSANDBOX_PROFILE - one or more comma-separated profiles (default:
 #                      "minimal"). Available profiles:
 #                        minimal - (nothing beyond the base)
@@ -186,7 +187,10 @@ profile_domains() {
   esac
 }
 
-DOMAIN_SET=("api.anthropic.com")   # base: always present
+# base: always present. api.anthropic.com is the inference API;
+# platform.claude.com is the OAuth token-refresh endpoint - without it the
+# seeded credentials die as soon as the access token expires (~hours).
+DOMAIN_SET=("api.anthropic.com" "platform.claude.com")
 IFS=',' read -ra PROFILES <<< "${CSANDBOX_PROFILE:-minimal}"
 for p in "${PROFILES[@]}"; do
   p="$(echo "$p" | tr -d '[:space:]')"
