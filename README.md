@@ -140,6 +140,12 @@ State lives outside this dir in `~/.claude-sandbox/` — the container's `~/.cla
 config dir (credentials, session history). It's created automatically; the login
 inside it is the sandbox's own (see Quick start).
 
+The agent also gets a persistent scratch dir: `~/.claude-sandbox/scratch` on the
+host, mounted at `/home/node/scratch` in the container. A seeded global
+`CLAUDE.md` points the agent there instead of at project `.claude/` dirs, whose
+writes always trigger Claude Code's hardcoded self-config approval prompt (it
+survives even `--dangerously-skip-permissions` + `Bash(*)`).
+
 ---
 
 ## Setup / installation

@@ -93,6 +93,23 @@ esac
 CONFIG_DIR="$HOME/.claude-sandbox"
 mkdir -p "$CONFIG_DIR"
 
+# Persistent scratch space for the agent, mounted at /home/node/scratch.
+# Writes under a .claude/ dir always trigger Claude Code's hardcoded
+# self-config guard (even with skip-permissions + Bash(*)), so agents get a
+# dedicated dir outside that namespace - pointed at it via the global
+# CLAUDE.md seeded below.
+SCRATCH_DIR="$CONFIG_DIR/scratch"
+mkdir -p "$SCRATCH_DIR"
+if [ ! -f "$CONFIG_DIR/CLAUDE.md" ] || ! grep -q '/home/node/scratch' "$CONFIG_DIR/CLAUDE.md"; then
+  cat >> "$CONFIG_DIR/CLAUDE.md" <<'EOF'
+
+# Scratch directory
+Use `/home/node/scratch/` for your own working files (notes, plans, temp
+scripts, intermediate results). Do NOT create or write into `.claude/`
+directories inside projects - writes there trigger approval prompts.
+EOF
+fi
+
 # The sandbox has its own login (token chain lives in ~/.claude-sandbox),
 # rather than a copy of the host credentials: OAuth refresh tokens rotate,
 # so a seeded copy dies as soon as the host client refreshes. First run:
@@ -253,6 +270,7 @@ set +e
 compose run --rm \
   -v "$WORKSPACE_MOUNT" \
   -v "$CONFIG_DIR:/home/node/.claude" \
+  -v "$SCRATCH_DIR:/home/node/scratch" \
   "${EXTRA_MOUNTS[@]}" \
   -w "$PROJECT_DIR" \
   sandbox \
