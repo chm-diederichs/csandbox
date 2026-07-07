@@ -221,7 +221,7 @@ fi
 if [ "${CSANDBOX_SHELL:-}" = "1" ]; then
   CMD=(bash)
 else
-  CMD=(claude --dangerously-skip-permissions "$@")
+  CMD=(env IS_SANDBOX=1 claude --dangerously-skip-permissions "$@")
 fi
 
 # --- launch -------------------------------------------------------------
