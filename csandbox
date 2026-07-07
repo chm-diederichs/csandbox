@@ -93,11 +93,13 @@ esac
 CONFIG_DIR="$HOME/.claude-sandbox"
 mkdir -p "$CONFIG_DIR"
 
-# seed sandbox credentials from the host once, so no re-login is needed
-if [ ! -f "$CONFIG_DIR/.credentials.json" ] && [ -f "$HOME/.claude/.credentials.json" ]; then
-  cp "$HOME/.claude/.credentials.json" "$CONFIG_DIR/.credentials.json"
-  chmod 600 "$CONFIG_DIR/.credentials.json"
-  echo "seeded credentials from ~/.claude into ~/.claude-sandbox"
+# The sandbox has its own login (token chain lives in ~/.claude-sandbox),
+# rather than a copy of the host credentials: OAuth refresh tokens rotate,
+# so a seeded copy dies as soon as the host client refreshes. First run:
+#   CSANDBOX_EXTRA_DOMAINS=claude.ai csandbox .   # then /login inside
+if [ ! -f "$CONFIG_DIR/.credentials.json" ]; then
+  echo "csandbox: no sandbox login yet - run /login inside (needs claude.ai allowed):"
+  echo "csandbox:   CSANDBOX_EXTRA_DOMAINS=claude.ai csandbox ."
 fi
 
 # a fresh container generates its own .claude.json (own machineID/userID)

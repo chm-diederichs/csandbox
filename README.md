@@ -25,9 +25,17 @@ csandbox . --continue          # trailing args are passed to `claude`
 CSANDBOX_PROFILE=dev csandbox . # allow npm + git + pypi for this session
 ```
 
-First run seeds your Claude credentials from `~/.claude` into `~/.claude-sandbox`
-so there's no login prompt. Trailing arguments after the project dir go straight
-to `claude`.
+The sandbox has its **own login**, stored in `~/.claude-sandbox` (copying the
+host credentials doesn't survive: OAuth refresh tokens rotate, so a seeded copy
+dies as soon as the host client refreshes). First run only:
+
+```bash
+CSANDBOX_EXTRA_DOMAINS=claude.ai csandbox .   # then /login inside
+```
+
+After that, launches need no extra domains — token refresh goes through
+`platform.claude.com`, which is always allowed. Trailing arguments after the
+project dir go straight to `claude`.
 
 ---
 
@@ -129,7 +137,8 @@ claude-sandbox/
 ```
 
 State lives outside this dir in `~/.claude-sandbox/` — the container's `~/.claude`
-config dir (credentials, session history). It's created and seeded automatically.
+config dir (credentials, session history). It's created automatically; the login
+inside it is the sandbox's own (see Quick start).
 
 ---
 
@@ -145,8 +154,8 @@ docker compose -f ~/hyper/claude-sandbox/docker-compose.yml -p claude-sandbox bu
 ln -sf ~/hyper/claude-sandbox/csandbox ~/.local/bin/csandbox
 ```
 
-Requires: Docker with the Compose plugin, and an existing host Claude Code login
-(`~/.claude/.credentials.json`) to seed from.
+Requires: Docker with the Compose plugin. On first launch, log the sandbox in
+with `CSANDBOX_EXTRA_DOMAINS=claude.ai csandbox .` then `/login` inside.
 
 ---
 
@@ -178,7 +187,7 @@ Requires: Docker with the Compose plugin, and an existing host Claude Code login
   inner Host/path — **not built here**; add it if your threat model needs defense
   against a genuinely adversarial in-sandbox process.
 
-- **API quota.** The seeded credentials let the sandboxed agent spend your Anthropic
+- **API quota.** The sandbox login lets the sandboxed agent spend your Anthropic
   quota — inherent to it being able to run Claude at all.
 
 - **Secret scrubbing is pattern-based.** It shadows known secret-shaped filenames; a
