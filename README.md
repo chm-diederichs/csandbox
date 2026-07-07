@@ -171,6 +171,10 @@ dependency** — that's a registry fetch, so it surfaces at the egress proxy
 rather than happening silently. Keep the parallel phase to work that uses the
 already-installed deps.
 
+The top-level agent is told all this via the seeded global `CLAUDE.md` (a
+"Parallel worktree subagents" section), so it fans out correctly without
+re-installing deps or reaching for the network mid-run.
+
 ---
 
 ## Setup / installation

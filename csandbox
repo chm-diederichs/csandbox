@@ -109,6 +109,19 @@ scripts, intermediate results). Do NOT create or write into `.claude/`
 directories inside projects - writes there trigger approval prompts.
 EOF
 fi
+if ! grep -q 'Parallel worktree subagents' "$CONFIG_DIR/CLAUDE.md" 2>/dev/null; then
+  cat >> "$CONFIG_DIR/CLAUDE.md" <<'EOF'
+
+# Parallel worktree subagents
+When a task parallelizes, fan out with `Agent(isolation: "worktree")` - each
+subagent gets its own worktree, all in this one container. node_modules is
+hydrated automatically when the worktree is created, so don't run `npm install`
+or treat the worktree as having no deps. Keep the parallel phase network-quiet:
+adding a NEW dependency needs the npm registry and will trip the egress gate, so
+do dependency changes before/after fanning out, not during. Use /home/node/scratch
+for handoffs between agents.
+EOF
+fi
 
 # The sandbox has its own login (token chain lives in ~/.claude-sandbox),
 # rather than a copy of the host credentials: OAuth refresh tokens rotate,
