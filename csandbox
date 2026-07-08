@@ -109,14 +109,31 @@ scripts, intermediate results). Do NOT create or write into `.claude/`
 directories inside projects - writes there trigger approval prompts.
 EOF
 fi
+if ! grep -q 'Top-level session worktree' "$CONFIG_DIR/CLAUDE.md" 2>/dev/null; then
+  cat >> "$CONFIG_DIR/CLAUDE.md" <<'EOF'
+
+# Top-level session worktree
+At the start of every session in a git repo, call `EnterWorktree` before
+touching any files, so my own edits land on a disposable branch instead of
+the user's checked-out working tree - the user is often hacking there
+concurrently and needs it left alone. `worktree.baseRef` is set to `head`,
+so the worktree branches from the current commit (not origin/default) -
+but note this only carries committed history, not the user's
+uncommitted/staged changes, since worktrees can't share those. When the
+work is done, leave the branch as-is (`ExitWorktree` with `action: "keep"`)
+and tell the user it's ready to review and merge manually - don't push,
+open a PR, or merge it myself unless asked.
+EOF
+fi
 if ! grep -q 'Parallel worktree subagents' "$CONFIG_DIR/CLAUDE.md" 2>/dev/null; then
   cat >> "$CONFIG_DIR/CLAUDE.md" <<'EOF'
 
 # Parallel worktree subagents
 When a task parallelizes, fan out with `Agent(isolation: "worktree")` - each
-subagent gets its own worktree, all in this one container. node_modules is
-hydrated automatically when the worktree is created, so don't run `npm install`
-or treat the worktree as having no deps. Keep the parallel phase network-quiet:
+subagent gets its own worktree, all in this one container. This nests fine
+under the top-level session's own worktree. node_modules is hydrated
+automatically when the worktree is created, so don't run `npm install` or
+treat the worktree as having no deps. Keep the parallel phase network-quiet:
 adding a NEW dependency needs the npm registry and will trip the egress gate, so
 do dependency changes before/after fanning out, not during. Use /home/node/scratch
 for handoffs between agents.
@@ -188,6 +205,11 @@ for rule in ('Bash(*)', 'Edit', 'Write', 'WebFetch', 'NotebookEdit'):
 # additional directory (file access only - no config side-loading, unlike
 # --add-dir). Set to exactly [root] each launch so it tracks the current mount.
 perms['additionalDirectories'] = [root]
+# EnterWorktree (called at session start per the "Top-level session worktree"
+# CLAUDE.md guidance) branches from the current commit rather than the default
+# branch. setdefault so this is only a seeded default - a user customization is
+# left untouched.
+d.setdefault('worktree', {}).setdefault('baseRef', 'head')
 with open(path, 'w') as f:
     json.dump(d, f, indent=2)
 EOF
