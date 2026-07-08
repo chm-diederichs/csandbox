@@ -48,6 +48,7 @@
 #   CSANDBOX_ROOT=~/src csandbox .               # custom workspace root
 #   CSANDBOX_READONLY=1 csandbox .               # mount workspace read-only
 #   CSANDBOX_SHELL=1 csandbox .                  # drop into bash, not claude
+#   csandbox --live .                            # edit the working tree directly (no worktree)
 #   CSANDBOX_DRYRUN=1 csandbox .                 # print resolved config & exit
 #   CSANDBOX_DOWN=1 csandbox                     # stop the proxy sidecar & exit
 
@@ -63,6 +64,17 @@ if [ "${CSANDBOX_DOWN:-}" = "1" ]; then
   compose down
   exit 0
 fi
+
+# pull csandbox's own flags out of the arg list; everything else goes to claude
+LIVE=0
+ARGS=()
+for a in "$@"; do
+  case "$a" in
+    --live) LIVE=1 ;;
+    *)      ARGS+=("$a") ;;
+  esac
+done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
 
 # first arg is the project dir if it's a directory, otherwise default to cwd
 if [ $# -gt 0 ] && [ -d "$1" ]; then
@@ -294,12 +306,23 @@ fi
 if [ "${CSANDBOX_SHELL:-}" = "1" ]; then
   CMD=(bash)
 else
-  CMD=(env IS_SANDBOX=1 claude --dangerously-skip-permissions "$@")
+  # By default the agent enters a disposable worktree at session start (see the
+  # "Top-level session worktree" block in the seeded CLAUDE.md). --live overrides
+  # that with a system-prompt directive, so the agent edits the checked-out tree
+  # directly - use it when you want its work to land on your working tree.
+  CLAUDE_ENV=(IS_SANDBOX=1)
+  CLAUDE_ARGS=(--dangerously-skip-permissions)
+  if [ "$LIVE" = 1 ]; then
+    CLAUDE_ENV+=(CSANDBOX_LIVE=1)
+    CLAUDE_ARGS+=(--append-system-prompt "This session was launched with csandbox --live: do NOT call EnterWorktree or move work onto a separate branch or worktree at startup. Edit the checked-out working tree directly - the user has deliberately chosen to work live over their current tree. This overrides the Top-level session worktree guidance in CLAUDE.md.")
+  fi
+  CMD=(env "${CLAUDE_ENV[@]}" claude "${CLAUDE_ARGS[@]}" "$@")
 fi
 
 # --- launch -------------------------------------------------------------
 echo "csandbox: mount $ROOT ($MOUNT_NOTE), $SCRUB_COUNT secret file(s) shadowed"
 echo "csandbox: egress allowlist -> $ALLOWED_DOMAINS"
+[ "$LIVE" = 1 ] && echo "csandbox: --live -> agent edits the working tree directly (no top-level worktree)"
 
 # dry run: show resolved config and stop before touching docker
 if [ "${CSANDBOX_DRYRUN:-}" = "1" ]; then

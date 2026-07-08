@@ -22,6 +22,7 @@ arbitrary host" risk that skip-permissions + open network would otherwise create
 csandbox                       # sandbox the current directory (minimal egress)
 csandbox ~/code/myapp          # sandbox a specific project
 csandbox . --continue          # trailing args are passed to `claude`
+csandbox --live .              # edit your working tree directly (see below)
 CSANDBOX_PROFILE=dev csandbox . # allow npm + git + pypi for this session
 ```
 
@@ -148,6 +149,27 @@ host, mounted at `/home/node/scratch` in the container. A seeded global
 `CLAUDE.md` points the agent there instead of at project `.claude/` dirs, whose
 writes always trigger Claude Code's hardcoded self-config approval prompt (it
 survives even `--dangerously-skip-permissions` + `Bash(*)`).
+
+---
+
+## Top-level session worktree
+
+By default, the seeded `CLAUDE.md` tells the agent to `EnterWorktree` at the
+start of every session in a git repo, so its edits land on a **disposable
+branch off the current commit** (`worktree.baseRef: "head"`) rather than on your
+checked-out tree — you're often hacking in the same repo concurrently and want it
+left alone. When the agent finishes it keeps the branch and leaves it for you to
+review and merge manually (it won't push, PR, or merge on its own). Note the
+worktree carries committed history only, not your uncommitted/staged changes.
+
+Pass **`--live`** to opt out: the agent then edits your working tree directly.
+This is a launcher-side system-prompt override, so it works regardless of what's
+in the seeded `CLAUDE.md`.
+
+```bash
+csandbox .          # default: agent works on its own throwaway branch
+csandbox --live .   # agent edits your checked-out working tree
+```
 
 ---
 
