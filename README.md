@@ -274,12 +274,16 @@ with `CSANDBOX_EXTRA_DOMAINS=claude.ai csandbox .` then `/login` inside.
   same `api.anthropic.com` connection Claude needs, and managed/remote settings
   outrank every local override by design.
 - **How prompts are eliminated instead.** In `default` mode a *bare* tool-name allow
-  rule auto-approves every use of that tool, so `csandbox` seeds
-  `permissions.allow: ["Bash(*)", "Edit", "Write", "WebFetch", "NotebookEdit"]` on
-  every launch. `Bash(*)` additionally suppresses Claude's built-in text-processing
-  (`awk`/`perl`/`sed`) and shell-expansion heuristics. Read-only tools never prompt.
-  This is safe because the Docker layer, not the permission engine, is the actual
-  security boundary.
+  rule auto-approves every use of that tool, so `csandbox` seeds an allow rule for
+  each local state-changing tool on every launch —
+  `Bash(*)`, `Edit`, `Write`, `WebFetch`, `WebSearch`, `NotebookEdit`, `Monitor`,
+  `Workflow`, `Skill`. Each non-Bash tool needs its own rule (`Bash(*)` covers only
+  the `Bash` tool), and this applies to subagents too. `Bash(*)` additionally
+  suppresses Claude's built-in text-processing (`awk`/`perl`/`sed`) and
+  shell-expansion heuristics. Read-only tools never prompt; outward-publishing tools
+  (`Artifact`, `ShareOnboardingGuide`) are deliberately left to prompt. This is safe
+  because the Docker layer, not the permission engine, is the actual security
+  boundary.
 - **Residual prompts that survive even this** (they only relax in true bypass mode,
   which is unavailable here): writes under protected dirs — `.claude`, `.git`,
   `.vscode`, etc. — and the `rm -rf /` / `rm -rf ~` circuit breakers. The protected-dir

@@ -190,7 +190,12 @@ EOF
 # state-changing tool. A bare tool-name allow rule (e.g. `Edit`, no parens)
 # auto-approves ALL uses of that tool; `Bash(*)` additionally suppresses the
 # built-in text-processing (awk/perl/sed) and shell-expansion heuristics.
-# Read-only tools (Read/Grep/Glob) never prompt, so they're omitted.
+# Each non-Bash tool needs its OWN rule - `Bash(*)` doesn't cover them - so the
+# list below enumerates the local tools that would otherwise prompt (Monitor,
+# WebSearch, Workflow, Skill, ...; subagents hit these too). Read-only tools
+# (Read/Grep/Glob) never prompt; outward-publishing tools (Artifact,
+# ShareOnboardingGuide) are left to prompt on purpose, and egress is governed
+# by the proxy regardless.
 # This is safe because the Docker layer - not the permission engine - is the
 # real boundary (non-root, no docker socket, network allowlisted, secrets
 # shadowed). Residual prompts we CANNOT remove without true bypass mode:
@@ -207,7 +212,8 @@ except FileNotFoundError:
     d = {}
 perms = d.setdefault('permissions', {})
 allow = perms.setdefault('allow', [])
-for rule in ('Bash(*)', 'Edit', 'Write', 'WebFetch', 'NotebookEdit'):
+for rule in ('Bash(*)', 'Edit', 'Write', 'WebFetch', 'WebSearch',
+             'NotebookEdit', 'Monitor', 'Workflow', 'Skill'):
     if rule not in allow:
         allow.append(rule)
 # By default Claude can only touch the dir it was launched in. The mount root
