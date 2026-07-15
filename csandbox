@@ -481,7 +481,13 @@ def git(d, *a):
 
 resume_dir  = cwds[-1] if cwds else project_dir       # session home (for --resume)
 base_branch = branches[0] if branches else ''
-work_branch = branches[-1] if branches else ''
+# work branch = the last branch that DIFFERS from the base. The agent is told to
+# ExitWorktree when done, which reverts gitBranch back to the base - so
+# branches[-1] would equal the base and hide the work done on the worktree
+# branch. (A same-branch session with commits and no worktree still looks like
+# summary_only here; recording base_sha at launch would fix that - a follow-up.)
+_work = [b for b in branches if b != base_branch]
+work_branch = _work[-1] if _work else (branches[-1] if branches else '')
 
 # Compute the reviewable branch/diff on the main checkout: branches are shared
 # across worktrees, so this works even if the worktree dir is cleaned up. A
