@@ -141,6 +141,18 @@ mkdir -p "$(dirname "$TASKS_DB")"
 # CLAUDE.md seeded below.
 SCRATCH_DIR="$CONFIG_DIR/scratch"
 mkdir -p "$SCRATCH_DIR"
+
+# Per-session summary artifact (docs/agent-contract.md): the agent writes its
+# review summary to $CSANDBOX_SUMMARY. It lives under scratch - agent-writable,
+# not committed, survives exit - namespaced by session id. Set only when the id
+# is known up front (fresh mint, or --resume/--session-id); a --continue/picker
+# run has no id yet, so it gets no summary path.
+CSANDBOX_SUMMARY=""
+if [ -n "$SESSION_ID" ]; then
+  mkdir -p "$SCRATCH_DIR/sessions/$SESSION_ID"
+  CSANDBOX_SUMMARY="/home/node/scratch/sessions/$SESSION_ID/summary.md"
+fi
+
 if [ ! -f "$CONFIG_DIR/CLAUDE.md" ] || ! grep -q '/home/node/scratch' "$CONFIG_DIR/CLAUDE.md"; then
   cat >> "$CONFIG_DIR/CLAUDE.md" <<'EOF'
 
@@ -178,6 +190,22 @@ treat the worktree as having no deps. Keep the parallel phase network-quiet:
 adding a NEW dependency needs the npm registry and will trip the egress gate, so
 do dependency changes before/after fanning out, not during. Use /home/node/scratch
 for handoffs between agents.
+EOF
+fi
+if ! grep -q 'Session output' "$CONFIG_DIR/CLAUDE.md" 2>/dev/null; then
+  cat >> "$CONFIG_DIR/CLAUDE.md" <<'EOF'
+
+# Session output
+Produce what the reviewer will look at (see docs/agent-contract.md):
+- COMMIT your work on the worktree branch before finishing - a commit is what
+  creates a reviewable diff; uncommitted changes are invisible to branch review.
+- ALWAYS write a short summary to the file named in the `$CSANDBOX_SUMMARY`
+  environment variable (run `echo "$CSANDBOX_SUMMARY"` to get the path), even if
+  you committed nothing (got stuck, or were only fact-finding). Use the headings:
+  `## Summary`, `## Changes`, `## Open questions / needs attention`, `## Blocked on`.
+- Do NOT put review feedback in inline code comments - it pollutes the diff.
+  Session-level notes go in the summary; line-level comments come back from the
+  human via the review tool.
 EOF
 fi
 
@@ -346,6 +374,7 @@ else
   # that with a system-prompt directive, so the agent edits the checked-out tree
   # directly - use it when you want its work to land on your working tree.
   CLAUDE_ENV=(IS_SANDBOX=1)
+  [ -n "$CSANDBOX_SUMMARY" ] && CLAUDE_ENV+=("CSANDBOX_SUMMARY=$CSANDBOX_SUMMARY")
   CLAUDE_ARGS=(--dangerously-skip-permissions)
   [ ${#MINT_SESSION_ARGS[@]} -gt 0 ] && CLAUDE_ARGS+=("${MINT_SESSION_ARGS[@]}")
   if [ "$LIVE" = 1 ]; then
@@ -400,13 +429,14 @@ fi
 # so concurrent sandboxes are just ordinary multi-process SQLite on a local fs
 # (busy_timeout absorbs the rare collision). Best-effort: never fail the launch
 # over recording. The session's working dir is read from the session file's
-# `cwd` (robust vs decoding the projects/ folder name); branch/head come from
-# git in that dir, and base is the fork point vs the main checkout.
+# gitBranch transitions in the session log (robust vs decoding the projects/
+# folder name), computed on the main checkout so they survive worktree cleanup.
+# Also records the summary artifact path and a coarse review status.
 if [ "${CSANDBOX_SHELL:-}" != "1" ]; then
-  python3 - "$TASKS_DB" "$SESSION_ID" "$PROJECT_DIR" "$CONFIG_DIR/projects" <<'PY' || true
+  python3 - "$TASKS_DB" "$SESSION_ID" "$PROJECT_DIR" "$CONFIG_DIR/projects" "$SCRATCH_DIR" <<'PY' || true
 import glob, json, os, sqlite3, subprocess, sys, time
 
-db, session_id, project_dir, projects_dir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+db, session_id, project_dir, projects_dir, scratch_dir = sys.argv[1:6]
 
 def session_file(sid):
     if sid:
@@ -463,33 +493,49 @@ base_sha = ''
 if work_branch and base_branch and work_branch != base_branch:
     base_sha = git(project_dir, 'merge-base', work_branch, base_branch)
 
+# summary artifact (absent if the agent wrote none, or a --continue run that had
+# no CSANDBOX_SUMMARY); recorded as the host path the review UI reads
+summary_path = os.path.join(scratch_dir, 'sessions', session_id, 'summary.md')
+if not os.path.exists(summary_path):
+    summary_path = ''
+
+# coarse review status: a diff to review, or none. 'blocked' is reserved for the
+# transcript prompt-scan follow-up (a session that stalled on a permission wall).
+status = 'ready' if base_sha else 'summary_only'
+
 now = int(time.time())
 con = sqlite3.connect(db, timeout=10)
 try:
     con.execute('PRAGMA busy_timeout=5000')
     con.execute('''CREATE TABLE IF NOT EXISTS sessions (
-        session_id TEXT PRIMARY KEY,
-        dir        TEXT,
-        branch     TEXT,
-        base_sha   TEXT,
-        head_sha   TEXT,
-        status     TEXT,
-        created_at INTEGER,
-        updated_at INTEGER
+        session_id   TEXT PRIMARY KEY,
+        dir          TEXT,
+        branch       TEXT,
+        base_sha     TEXT,
+        head_sha     TEXT,
+        status       TEXT,
+        summary_path TEXT,
+        created_at   INTEGER,
+        updated_at   INTEGER
     )''')
+    # migrate dbs created before summary_path existed
+    if 'summary_path' not in [r[1] for r in con.execute('PRAGMA table_info(sessions)')]:
+        con.execute('ALTER TABLE sessions ADD COLUMN summary_path TEXT')
     con.execute('''INSERT INTO sessions
-          (session_id, dir, branch, base_sha, head_sha, status, created_at, updated_at)
-        VALUES (?,?,?,?,?,?,?,?)
+          (session_id, dir, branch, base_sha, head_sha, status, summary_path,
+           created_at, updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?)
         ON CONFLICT(session_id) DO UPDATE SET
           dir=excluded.dir, branch=excluded.branch, base_sha=excluded.base_sha,
           head_sha=excluded.head_sha, status=excluded.status,
-          updated_at=excluded.updated_at''',
-        (session_id, resume_dir, branch, base_sha, head_sha, 'ready', now, now))
+          summary_path=excluded.summary_path, updated_at=excluded.updated_at''',
+        (session_id, resume_dir, branch, base_sha, head_sha, status, summary_path,
+         now, now))
     con.commit()
 finally:
     con.close()
-sys.stderr.write("csandbox: recorded session %s (branch=%s) in tasks db\n"
-                 % (session_id[:8], branch or '-'))
+sys.stderr.write("csandbox: recorded session %s (branch=%s, status=%s) in tasks db\n"
+                 % (session_id[:8], branch or '-', status))
 PY
 fi
 
