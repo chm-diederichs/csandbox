@@ -102,8 +102,37 @@ case "$PROJECT_DIR" in
     ;;
 esac
 
+# --- session identity -----------------------------------------------------
+# Every run is recorded in the tasks db (see the recorder in the post-run
+# block). We need this run's claude session id: reuse a pinned (--session-id)
+# or resumed (--resume <id> / -r <id>) one; leave it empty for --continue or
+# the bare --resume picker (the recorder discovers it after exit); otherwise
+# mint a uuid and pin it - which also makes plain standalone runs resumable.
+SESSION_ID=""
+MINT_SESSION_ARGS=()
+_prev=""; _has_session_flag=0
+for a in "$@"; do
+  case "$a" in
+    --session-id|--resume|-r|--continue|-c) _has_session_flag=1 ;;
+  esac
+  case "$_prev" in
+    --session-id|--resume|-r) case "$a" in -*) ;; *) SESSION_ID="$a" ;; esac ;;
+  esac
+  _prev="$a"
+done
+if [ -z "$SESSION_ID" ] && [ "$_has_session_flag" = 0 ] && [ "${CSANDBOX_SHELL:-}" != "1" ]; then
+  SESSION_ID="$(cat /proc/sys/kernel/random/uuid)"
+  MINT_SESSION_ARGS=(--session-id "$SESSION_ID")
+fi
+
 CONFIG_DIR="$HOME/.claude-sandbox"
 mkdir -p "$CONFIG_DIR"
+
+# tasks db: host-side, and OUTSIDE the bind-mounted config dir so the sandboxed
+# agent can't see or mutate it. csandbox records one row per run here on exit;
+# the review UI reads it. Override the path with CSANDBOX_TASKS_DB.
+TASKS_DB="${CSANDBOX_TASKS_DB:-$HOME/.local/share/csandbox/tasks.db}"
+mkdir -p "$(dirname "$TASKS_DB")"
 
 # Persistent scratch space for the agent, mounted at /home/node/scratch.
 # Writes under a .claude/ dir always trigger Claude Code's hardcoded
@@ -318,6 +347,7 @@ else
   # directly - use it when you want its work to land on your working tree.
   CLAUDE_ENV=(IS_SANDBOX=1)
   CLAUDE_ARGS=(--dangerously-skip-permissions)
+  [ ${#MINT_SESSION_ARGS[@]} -gt 0 ] && CLAUDE_ARGS+=("${MINT_SESSION_ARGS[@]}")
   if [ "$LIVE" = 1 ]; then
     CLAUDE_ENV+=(CSANDBOX_LIVE=1)
     CLAUDE_ARGS+=(--append-system-prompt "This session was launched with csandbox --live: do NOT call EnterWorktree or move work onto a separate branch or worktree at startup. Edit the checked-out working tree directly - the user has deliberately chosen to work live over their current tree. This overrides the Top-level session worktree guidance in CLAUDE.md.")
@@ -363,6 +393,104 @@ BLOCKED="$(compose logs proxy --since "$SINCE" 2>/dev/null \
 if [ -n "$BLOCKED" ]; then
   echo "csandbox: blocked egress this session -> $BLOCKED"
   echo "csandbox: to allow, re-run with CSANDBOX_EXTRA_DOMAINS=$BLOCKED (or a profile)"
+fi
+
+# --- record this run in the tasks db (host-side) -------------------------
+# One row per run for the review UI. Written on the host, not in the container,
+# so concurrent sandboxes are just ordinary multi-process SQLite on a local fs
+# (busy_timeout absorbs the rare collision). Best-effort: never fail the launch
+# over recording. The session's working dir is read from the session file's
+# `cwd` (robust vs decoding the projects/ folder name); branch/head come from
+# git in that dir, and base is the fork point vs the main checkout.
+if [ "${CSANDBOX_SHELL:-}" != "1" ]; then
+  python3 - "$TASKS_DB" "$SESSION_ID" "$PROJECT_DIR" "$CONFIG_DIR/projects" <<'PY' || true
+import glob, json, os, sqlite3, subprocess, sys, time
+
+db, session_id, project_dir, projects_dir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
+def session_file(sid):
+    if sid:
+        hits = glob.glob(os.path.join(projects_dir, '*', sid + '.jsonl'))
+        return hits[0] if hits else None
+    files = glob.glob(os.path.join(projects_dir, '*', '*.jsonl'))
+    return max(files, key=os.path.getmtime) if files else None
+
+f = session_file(session_id)
+if not f:
+    sys.exit(0)                       # nothing ran / not found - skip quietly
+if not session_id:
+    session_id = os.path.basename(f)[:-len('.jsonl')]
+
+# Collect cwd + gitBranch transitions. The session starts in the launch dir on
+# the base branch, then EnterWorktree moves it into a worktree on a new branch,
+# so the LAST values are the ones that matter (first cwd/branch are just the
+# launch state). A trailing ExitWorktree may revert them, but the branch object
+# persists, so we diff by branch name on the main checkout below.
+cwds = []; branches = []
+try:
+    with open(f, encoding='utf-8') as fh:
+        for line in fh:
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            c = rec.get('cwd'); b = rec.get('gitBranch')
+            if c and (not cwds or cwds[-1] != c): cwds.append(c)
+            if b and (not branches or branches[-1] != b): branches.append(b)
+except Exception:
+    pass
+
+def git(d, *a):
+    try:
+        return subprocess.check_output(['git', '-C', d, *a],
+                                       stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        return ''
+
+resume_dir  = cwds[-1] if cwds else project_dir       # session home (for --resume)
+base_branch = branches[0] if branches else ''
+work_branch = branches[-1] if branches else ''
+
+# Compute the reviewable branch/diff on the main checkout: branches are shared
+# across worktrees, so this works even if the worktree dir is cleaned up. A
+# session that never left the base branch (e.g. --live) has no separate branch
+# to diff - record head only, leave base empty (a working-tree review).
+branch   = work_branch or git(project_dir, 'rev-parse', '--abbrev-ref', 'HEAD')
+head_sha = git(project_dir, 'rev-parse', work_branch or 'HEAD')
+base_sha = ''
+if work_branch and base_branch and work_branch != base_branch:
+    base_sha = git(project_dir, 'merge-base', work_branch, base_branch)
+
+now = int(time.time())
+con = sqlite3.connect(db, timeout=10)
+try:
+    con.execute('PRAGMA busy_timeout=5000')
+    con.execute('''CREATE TABLE IF NOT EXISTS sessions (
+        session_id TEXT PRIMARY KEY,
+        dir        TEXT,
+        branch     TEXT,
+        base_sha   TEXT,
+        head_sha   TEXT,
+        status     TEXT,
+        created_at INTEGER,
+        updated_at INTEGER
+    )''')
+    con.execute('''INSERT INTO sessions
+          (session_id, dir, branch, base_sha, head_sha, status, created_at, updated_at)
+        VALUES (?,?,?,?,?,?,?,?)
+        ON CONFLICT(session_id) DO UPDATE SET
+          dir=excluded.dir, branch=excluded.branch, base_sha=excluded.base_sha,
+          head_sha=excluded.head_sha, status=excluded.status,
+          updated_at=excluded.updated_at''',
+        (session_id, resume_dir, branch, base_sha, head_sha, 'ready', now, now))
+    con.commit()
+finally:
+    con.close()
+sys.stderr.write("csandbox: recorded session %s (branch=%s) in tasks db\n"
+                 % (session_id[:8], branch or '-'))
+PY
 fi
 
 exit $RC
