@@ -67,11 +67,13 @@ fi
 
 # pull csandbox's own flags out of the arg list; everything else goes to claude
 LIVE=0
+NAME=""
 ARGS=()
-for a in "$@"; do
-  case "$a" in
-    --live) LIVE=1 ;;
-    *)      ARGS+=("$a") ;;
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --live) LIVE=1; shift ;;
+    --name) NAME="${2:-}"; shift 2 2>/dev/null || shift ;;   # human label for the review UI
+    *)      ARGS+=("$1"); shift ;;
   esac
 done
 set -- "${ARGS[@]+"${ARGS[@]}"}"
@@ -439,10 +441,10 @@ fi
 # folder name), computed on the main checkout so they survive worktree cleanup.
 # Also records the summary artifact path and a coarse review status.
 if [ "${CSANDBOX_SHELL:-}" != "1" ]; then
-  python3 - "$TASKS_DB" "$SESSION_ID" "$PROJECT_DIR" "$CONFIG_DIR/projects" "$SCRATCH_DIR" <<'PY' || true
+  python3 - "$TASKS_DB" "$SESSION_ID" "$PROJECT_DIR" "$CONFIG_DIR/projects" "$SCRATCH_DIR" "$NAME" <<'PY' || true
 import glob, json, os, sqlite3, subprocess, sys, time
 
-db, session_id, project_dir, projects_dir, scratch_dir = sys.argv[1:6]
+db, session_id, project_dir, projects_dir, scratch_dir, name = sys.argv[1:7]
 
 def session_file(sid):
     if sid:
@@ -532,12 +534,17 @@ if work_branch and os.path.exists(manifest):
 # transcript prompt-scan follow-up (a session that stalled on a permission wall).
 status = 'ready' if base_sha else 'summary_only'
 
+# display label: the --name if given, else the branch slug (already semi-readable)
+if not name:
+    name = branch[len('worktree-'):] if branch.startswith('worktree-') else (branch or session_id[:8])
+
 now = int(time.time())
 con = sqlite3.connect(db, timeout=10)
 try:
     con.execute('PRAGMA busy_timeout=5000')
     con.execute('''CREATE TABLE IF NOT EXISTS sessions (
         session_id   TEXT PRIMARY KEY,
+        name         TEXT,
         dir          TEXT,
         branch       TEXT,
         base_sha     TEXT,
@@ -547,19 +554,23 @@ try:
         created_at   INTEGER,
         updated_at   INTEGER
     )''')
-    # migrate dbs created before summary_path existed
-    if 'summary_path' not in [r[1] for r in con.execute('PRAGMA table_info(sessions)')]:
+    # migrate dbs created before these columns existed
+    cols = [r[1] for r in con.execute('PRAGMA table_info(sessions)')]
+    if 'summary_path' not in cols:
         con.execute('ALTER TABLE sessions ADD COLUMN summary_path TEXT')
+    if 'name' not in cols:
+        con.execute('ALTER TABLE sessions ADD COLUMN name TEXT')
     con.execute('''INSERT INTO sessions
-          (session_id, dir, branch, base_sha, head_sha, status, summary_path,
+          (session_id, name, dir, branch, base_sha, head_sha, status, summary_path,
            created_at, updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(session_id) DO UPDATE SET
-          dir=excluded.dir, branch=excluded.branch, base_sha=excluded.base_sha,
-          head_sha=excluded.head_sha, status=excluded.status,
-          summary_path=excluded.summary_path, updated_at=excluded.updated_at''',
-        (session_id, resume_dir, branch, base_sha, head_sha, status, summary_path,
-         now, now))
+          name=excluded.name, dir=excluded.dir, branch=excluded.branch,
+          base_sha=excluded.base_sha, head_sha=excluded.head_sha,
+          status=excluded.status, summary_path=excluded.summary_path,
+          updated_at=excluded.updated_at''',
+        (session_id, name, resume_dir, branch, base_sha, head_sha, status,
+         summary_path, now, now))
     con.commit()
 finally:
     con.close()
