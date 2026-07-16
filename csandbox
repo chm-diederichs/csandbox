@@ -148,9 +148,14 @@ mkdir -p "$SCRATCH_DIR"
 # is known up front (fresh mint, or --resume/--session-id); a --continue/picker
 # run has no id yet, so it gets no summary path.
 CSANDBOX_SUMMARY=""
+CSANDBOX_MANIFEST=""
 if [ -n "$SESSION_ID" ]; then
   mkdir -p "$SCRATCH_DIR/sessions/$SESSION_ID"
   CSANDBOX_SUMMARY="/home/node/scratch/sessions/$SESSION_ID/summary.md"
+  # every worktree created this session (top-level or subagent) is appended here
+  # by the post-checkout hook; csandbox ingests it on exit to register sessions
+  # (the container can't write the tasks db, which lives outside the mount).
+  CSANDBOX_MANIFEST="/home/node/scratch/sessions/$SESSION_ID/worktrees.jsonl"
 fi
 
 if [ ! -f "$CONFIG_DIR/CLAUDE.md" ] || ! grep -q '/home/node/scratch' "$CONFIG_DIR/CLAUDE.md"; then
@@ -375,6 +380,7 @@ else
   # directly - use it when you want its work to land on your working tree.
   CLAUDE_ENV=(IS_SANDBOX=1)
   [ -n "$CSANDBOX_SUMMARY" ] && CLAUDE_ENV+=("CSANDBOX_SUMMARY=$CSANDBOX_SUMMARY")
+  [ -n "$CSANDBOX_MANIFEST" ] && CLAUDE_ENV+=("CSANDBOX_MANIFEST=$CSANDBOX_MANIFEST")
   CLAUDE_ARGS=(--dangerously-skip-permissions)
   [ ${#MINT_SESSION_ARGS[@]} -gt 0 ] && CLAUDE_ARGS+=("${MINT_SESSION_ARGS[@]}")
   if [ "$LIVE" = 1 ]; then
@@ -504,6 +510,23 @@ if work_branch and base_branch and work_branch != base_branch:
 summary_path = os.path.join(scratch_dir, 'sessions', session_id, 'summary.md')
 if not os.path.exists(summary_path):
     summary_path = ''
+
+# The post-checkout hook records each worktree's exact fork point in the
+# manifest; prefer it for the work branch's base - more accurate than merge-base,
+# and the foundation for the subagent tree (later steps read the whole manifest).
+manifest = os.path.join(scratch_dir, 'sessions', session_id, 'worktrees.jsonl')
+if work_branch and os.path.exists(manifest):
+    try:
+        with open(manifest, encoding='utf-8') as fh:
+            for line in fh:
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(e, dict) and e.get('branch') == work_branch and e.get('fork_sha'):
+                    base_sha = e['fork_sha']
+    except Exception:
+        pass
 
 # coarse review status: a diff to review, or none. 'blocked' is reserved for the
 # transcript prompt-scan follow-up (a session that stalled on a permission wall).

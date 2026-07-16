@@ -20,5 +20,18 @@ common="$(git rev-parse --git-common-dir 2>/dev/null)" || exit 0
 gitdir="$(git rev-parse --git-dir 2>/dev/null)" || exit 0
 [ "$common" != "$gitdir" ] || exit 0         # main worktree -> skip
 
+# Record the worktree creation for csandbox to ingest on exit. The container
+# can't write the tasks db (it lives outside the mount), so every worktree -
+# top-level or subagent - is appended to this manifest in a mounted path;
+# csandbox reads it host-side and registers the sessions. fork_sha is the commit
+# the worktree branched from: it's the diff base and identifies the parent.
+if [ -n "${CSANDBOX_MANIFEST:-}" ]; then
+  printf '{"path":"%s","branch":"%s","fork_sha":"%s","created_at":%s}\n' \
+    "$PWD" \
+    "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" \
+    "$(git rev-parse HEAD 2>/dev/null)" \
+    "$(date +%s)" >> "$CSANDBOX_MANIFEST" 2>/dev/null || true
+fi
+
 command -v wt-hydrate >/dev/null 2>&1 && wt-hydrate "$PWD" || true
 exit 0
