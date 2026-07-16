@@ -151,6 +151,7 @@ mkdir -p "$SCRATCH_DIR"
 # run has no id yet, so it gets no summary path.
 CSANDBOX_SUMMARY=""
 CSANDBOX_MANIFEST=""
+CSANDBOX_SNAPSHOT=""
 if [ -n "$SESSION_ID" ]; then
   mkdir -p "$SCRATCH_DIR/sessions/$SESSION_ID"
   CSANDBOX_SUMMARY="/home/node/scratch/sessions/$SESSION_ID/summary.md"
@@ -158,6 +159,29 @@ if [ -n "$SESSION_ID" ]; then
   # by the post-checkout hook; csandbox ingests it on exit to register sessions
   # (the container can't write the tasks db, which lives outside the mount).
   CSANDBOX_MANIFEST="/home/node/scratch/sessions/$SESSION_ID/worktrees.jsonl"
+  # Freeze every repo state under ROOT at spawn (branch + sha). Agents work off
+  # this snapshot so concurrent host-side checkouts/commits can't disturb a
+  # running session; csbox-enter-repo worktrees a repo pinned to its snapshot,
+  # and subagents inherit it via the env var. ~150ms over ~/hyper (parallel).
+  CSANDBOX_SNAPSHOT="/home/node/scratch/sessions/$SESSION_ID/snapshot.json"
+  python3 - "$ROOT" "$SCRATCH_DIR/sessions/$SESSION_ID/snapshot.json" <<'PY' 2>/dev/null || true
+import glob, json, os, subprocess, sys
+from concurrent.futures import ThreadPoolExecutor
+root, out = sys.argv[1], sys.argv[2]
+repos = [os.path.dirname(g) for g in glob.glob(os.path.join(root, '*', '.git'))]
+def snap(r):
+    try:
+        b = subprocess.check_output(['git', '-C', r, 'rev-parse', '--abbrev-ref', 'HEAD'],
+                                    stderr=subprocess.DEVNULL).decode().strip()
+        s = subprocess.check_output(['git', '-C', r, 'rev-parse', 'HEAD'],
+                                    stderr=subprocess.DEVNULL).decode().strip()
+        return (r, {'branch': b, 'sha': s}) if s else None
+    except Exception:
+        return None
+with ThreadPoolExecutor(max_workers=8) as ex:
+    d = dict(x for x in ex.map(snap, repos) if x)
+json.dump(d, open(out, 'w'))
+PY
 fi
 
 if [ ! -f "$CONFIG_DIR/CLAUDE.md" ] || ! grep -q '/home/node/scratch' "$CONFIG_DIR/CLAUDE.md"; then
@@ -213,6 +237,18 @@ Produce what the reviewer will look at (see docs/agent-contract.md):
 - Do NOT put review feedback in inline code comments - it pollutes the diff.
   Session-level notes go in the summary; line-level comments come back from the
   human via the review tool.
+EOF
+fi
+if ! grep -q 'Crossing repos' "$CONFIG_DIR/CLAUDE.md" 2>/dev/null; then
+  cat >> "$CONFIG_DIR/CLAUDE.md" <<'EOF'
+
+# Crossing repos
+To work in a DIFFERENT repo under the workspace than the one you started in, do
+NOT just cd into it - run `csbox-enter-repo <repo>` (a path or a bare repo name)
+and work in the path it prints. That worktrees the repo pinned to this session's
+frozen snapshot, so your view stays consistent with spawn time and isolated from
+any host-side checkouts or commits since. Subagents share the same per-repo
+worktree automatically.
 EOF
 fi
 
@@ -383,6 +419,9 @@ else
   CLAUDE_ENV=(IS_SANDBOX=1)
   [ -n "$CSANDBOX_SUMMARY" ] && CLAUDE_ENV+=("CSANDBOX_SUMMARY=$CSANDBOX_SUMMARY")
   [ -n "$CSANDBOX_MANIFEST" ] && CLAUDE_ENV+=("CSANDBOX_MANIFEST=$CSANDBOX_MANIFEST")
+  # CSANDBOX_SESSION_ID + CSANDBOX_SNAPSHOT are inherited by subagents, so they
+  # share this session's frozen snapshot and per-repo worktrees.
+  [ -n "$CSANDBOX_SNAPSHOT" ] && CLAUDE_ENV+=("CSANDBOX_SNAPSHOT=$CSANDBOX_SNAPSHOT" "CSANDBOX_SESSION_ID=$SESSION_ID")
   CLAUDE_ARGS=(--dangerously-skip-permissions)
   [ ${#MINT_SESSION_ARGS[@]} -gt 0 ] && CLAUDE_ARGS+=("${MINT_SESSION_ARGS[@]}")
   if [ "$LIVE" = 1 ]; then

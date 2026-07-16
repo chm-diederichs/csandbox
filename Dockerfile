@@ -29,7 +29,9 @@ RUN npm install -g @anthropic-ai/claude-code
 # system one and the hook won't run.
 COPY git-hooks/post-checkout /usr/local/share/git-hooks/post-checkout
 COPY git-hooks/wt-hydrate /usr/local/bin/wt-hydrate
+COPY git-hooks/csbox-enter-repo /usr/local/bin/csbox-enter-repo
 RUN chmod +x /usr/local/share/git-hooks/post-checkout /usr/local/bin/wt-hydrate \
+      /usr/local/bin/csbox-enter-repo \
  && git config --system core.hooksPath /usr/local/share/git-hooks
 
 # the node image ships a "node" user with uid/gid 1000, matching the host

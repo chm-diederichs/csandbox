@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+#
+# csbox-enter-repo <repo path or name>
+#
+# Create (or reuse) a worktree of another repo under the workspace root, pinned
+# to THIS session's spawn snapshot - so cross-repo work is isolated from and
+# consistent with the frozen environment, regardless of any host-side checkouts
+# or commits since spawn. Prints the worktree path; do your work in that path.
+#
+# Subagents inherit the same per-repo worktree automatically: it's keyed by the
+# session id (CSANDBOX_SESSION_ID), which they inherit via the environment. The
+# snapshot is read from CSANDBOX_SNAPSHOT (set by csandbox at spawn).
+set -uo pipefail
+
+target="${1:-}"
+[ -n "$target" ] || { echo "usage: csbox-enter-repo <repo path or name>" >&2; exit 1; }
+snap="${CSANDBOX_SNAPSHOT:-}"
+{ [ -n "$snap" ] && [ -f "$snap" ]; } || { echo "csbox-enter-repo: no snapshot (CSANDBOX_SNAPSHOT=$snap)" >&2; exit 1; }
+
+# resolve the target (absolute path, or bare repo name) against the snapshot,
+# and read its pinned sha
+repo=""; sha=""
+read -r repo sha < <(python3 - "$snap" "$target" <<'PY' || true
+import json, os, sys
+snap, target = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(snap))
+except Exception:
+    sys.exit()
+for c in (target, os.path.abspath(target), *[r for r in d if os.path.basename(r) == target]):
+    if c in d:
+        print(c, d[c]['sha']); break
+PY
+)
+{ [ -n "$repo" ] && [ -n "$sha" ]; } || { echo "csbox-enter-repo: '$target' is not a repo in this session's snapshot" >&2; exit 1; }
+
+sid="${CSANDBOX_SESSION_ID:-session}"
+wt="$repo/.claude/worktrees/xrepo-$sid"
+branch="worktree-$sid"
+
+if [ ! -d "$wt" ]; then
+  git -C "$repo" worktree prune 2>/dev/null || true          # clear any stale registration
+  # new branch off the snapshot sha; if the branch already exists (a subagent
+  # got here first), attach the worktree to it instead
+  git -C "$repo" worktree add -b "$branch" "$wt" "$sha" >&2 2>/dev/null \
+    || git -C "$repo" worktree add "$wt" "$branch" >&2 2>/dev/null \
+    || { echo "csbox-enter-repo: could not create a worktree in $repo" >&2; exit 1; }
+fi
+echo "$wt"
