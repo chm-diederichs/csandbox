@@ -152,6 +152,7 @@ mkdir -p "$SCRATCH_DIR"
 CSANDBOX_SUMMARY=""
 CSANDBOX_MANIFEST=""
 CSANDBOX_SNAPSHOT=""
+CSANDBOX_COMMENTS=""
 if [ -n "$SESSION_ID" ]; then
   mkdir -p "$SCRATCH_DIR/sessions/$SESSION_ID"
   CSANDBOX_SUMMARY="/home/node/scratch/sessions/$SESSION_ID/summary.md"
@@ -164,6 +165,10 @@ if [ -n "$SESSION_ID" ]; then
   # running session; csbox-enter-repo worktrees a repo pinned to its snapshot,
   # and subagents inherit it via the env var. ~150ms over ~/hyper (parallel).
   CSANDBOX_SNAPSHOT="/home/node/scratch/sessions/$SESSION_ID/snapshot.json"
+  # append-only review-comment log (docs/review-loop.md): reviewers (human via
+  # csreview, or an agent via the review skill) append comment/resolved/compiled
+  # events; one log per session, keyed {repo,branch}. Inherited by subagents.
+  CSANDBOX_COMMENTS="/home/node/scratch/sessions/$SESSION_ID/comments.jsonl"
   python3 - "$ROOT" "$SCRATCH_DIR/sessions/$SESSION_ID/snapshot.json" <<'PY' 2>/dev/null || true
 import glob, json, os, subprocess, sys
 from concurrent.futures import ThreadPoolExecutor
@@ -182,6 +187,15 @@ with ThreadPoolExecutor(max_workers=8) as ex:
     d = dict(x for x in ex.map(snap, repos) if x)
 json.dump(d, open(out, 'w'))
 PY
+fi
+
+# Detect the host linker (mounted in further down). Resolved here so the CLAUDE.md
+# guidance below is only seeded when linked-dep support is actually active.
+LINKER_DIR=""
+LINKER_CLI="$(command -v linker 2>/dev/null || true)"
+if [ -n "$LINKER_CLI" ]; then
+  _ld="$(dirname "$(readlink -f "$LINKER_CLI")")"
+  [ -f "$_ld/cli.js" ] && LINKER_DIR="$_ld"
 fi
 
 if [ ! -f "$CONFIG_DIR/CLAUDE.md" ] || ! grep -q '/home/node/scratch' "$CONFIG_DIR/CLAUDE.md"; then
@@ -249,6 +263,20 @@ and work in the path it prints. That worktrees the repo pinned to this session's
 frozen snapshot, so your view stays consistent with spawn time and isolated from
 any host-side checkouts or commits since. Subagents share the same per-repo
 worktree automatically.
+EOF
+fi
+if [ -n "$LINKER_DIR" ] && ! grep -q 'Linked local dependencies' "$CONFIG_DIR/CLAUDE.md" 2>/dev/null; then
+  cat >> "$CONFIG_DIR/CLAUDE.md" <<'EOF'
+
+# Linked local dependencies
+If a repo has a `links.json`, its local-dependency links are wired up
+AUTOMATICALLY when its worktree is created (`linker load`, run by the same hook
+that hydrates node_modules): each linked dep becomes a worktree pinned to the
+sha in links.json, isolated to this worktree's branch, and symlinked into
+node_modules. So do NOT run `npm link` or hand-symlink local deps - it's already
+done and isolated. To add or re-pin a link, edit the dep and run `linker pin` in
+the repo (updates links.json, which you then commit). Run `linker check` to
+flag any stray node_modules symlink that isn't declared in links.json.
 EOF
 fi
 
@@ -338,6 +366,22 @@ if [ -f "$HOME/.gitconfig" ]; then
   EXTRA_MOUNTS+=(-v "$HOME/.gitconfig:/home/node/.gitconfig:ro")
 fi
 
+# --- linker: declarative local-dev linking ------------------------------
+# linker wires a repo's node_modules to worktrees of its local deps, pinned by
+# sha (links.json), applied per-worktree by the post-checkout hook. It's an
+# unpublished host tool (detected above), so we mount it in rather than bake it
+# into the image: its package dir at /opt/linker, a tiny wrapper on PATH, and
+# the host registry (name->path). Host paths are valid in-container because the
+# workspace mounts at the same path.
+if [ -n "$LINKER_DIR" ]; then
+  LINKER_WRAPPER="$(dirname "$TASKS_DB")/linker-wrapper"
+  printf '#!/bin/sh\nexec node /opt/linker/cli.js "$@"\n' > "$LINKER_WRAPPER"
+  chmod +x "$LINKER_WRAPPER"
+  EXTRA_MOUNTS+=(-v "$LINKER_DIR:/opt/linker:ro" -v "$LINKER_WRAPPER:/usr/local/bin/linker:ro")
+  [ -f "$HOME/.linker/registry.json" ] \
+    && EXTRA_MOUNTS+=(-v "$HOME/.linker/registry.json:/home/node/.linker/registry.json:ro")
+fi
+
 # --- secret scrubbing -------------------------------------------------
 # Shadow known secret-shaped files under the mounted root with an empty
 # read-only file inside the container. The host files are never touched -
@@ -419,6 +463,7 @@ else
   CLAUDE_ENV=(IS_SANDBOX=1)
   [ -n "$CSANDBOX_SUMMARY" ] && CLAUDE_ENV+=("CSANDBOX_SUMMARY=$CSANDBOX_SUMMARY")
   [ -n "$CSANDBOX_MANIFEST" ] && CLAUDE_ENV+=("CSANDBOX_MANIFEST=$CSANDBOX_MANIFEST")
+  [ -n "$CSANDBOX_COMMENTS" ] && CLAUDE_ENV+=("CSANDBOX_COMMENTS=$CSANDBOX_COMMENTS")
   # CSANDBOX_SESSION_ID + CSANDBOX_SNAPSHOT are inherited by subagents, so they
   # share this session's frozen snapshot and per-repo worktrees.
   [ -n "$CSANDBOX_SNAPSHOT" ] && CLAUDE_ENV+=("CSANDBOX_SNAPSHOT=$CSANDBOX_SNAPSHOT" "CSANDBOX_SESSION_ID=$SESSION_ID")
@@ -434,11 +479,13 @@ fi
 # --- launch -------------------------------------------------------------
 echo "csandbox: mount $ROOT ($MOUNT_NOTE), $SCRUB_COUNT secret file(s) shadowed"
 echo "csandbox: egress allowlist -> $ALLOWED_DOMAINS"
+[ -n "$LINKER_DIR" ] && echo "csandbox: linker -> $LINKER_DIR (declarative local links wired per-worktree)"
 [ "$LIVE" = 1 ] && echo "csandbox: --live -> agent edits the working tree directly (no top-level worktree)"
 
 # dry run: show resolved config and stop before touching docker
 if [ "${CSANDBOX_DRYRUN:-}" = "1" ]; then
   echo "csandbox: workdir $PROJECT_DIR"
+  for m in "${EXTRA_MOUNTS[@]}"; do [ "$m" = "-v" ] || echo "csandbox: extra mount $m"; done
   echo "csandbox: (dry run, not launching)"
   exit 0
 fi
@@ -573,6 +620,13 @@ if work_branch and os.path.exists(manifest):
 # transcript prompt-scan follow-up (a session that stalled on a permission wall).
 status = 'ready' if base_sha else 'summary_only'
 
+# the session's scratch dir - where csreview finds this session's per-worktree
+# manifest (worktrees.jsonl -> the subagent branches to review) and the review
+# comment log (comments.jsonl). One pointer; the rest are siblings.
+artifacts_dir = os.path.join(scratch_dir, 'sessions', session_id)
+if not os.path.isdir(artifacts_dir):
+    artifacts_dir = ''
+
 # display label: the --name if given, else the branch slug (already semi-readable)
 if not name:
     name = branch[len('worktree-'):] if branch.startswith('worktree-') else (branch or session_id[:8])
@@ -588,10 +642,11 @@ try:
         branch       TEXT,
         base_sha     TEXT,
         head_sha     TEXT,
-        status       TEXT,
-        summary_path TEXT,
-        created_at   INTEGER,
-        updated_at   INTEGER
+        status        TEXT,
+        summary_path  TEXT,
+        artifacts_dir TEXT,
+        created_at    INTEGER,
+        updated_at    INTEGER
     )''')
     # migrate dbs created before these columns existed
     cols = [r[1] for r in con.execute('PRAGMA table_info(sessions)')]
@@ -599,17 +654,19 @@ try:
         con.execute('ALTER TABLE sessions ADD COLUMN summary_path TEXT')
     if 'name' not in cols:
         con.execute('ALTER TABLE sessions ADD COLUMN name TEXT')
+    if 'artifacts_dir' not in cols:
+        con.execute('ALTER TABLE sessions ADD COLUMN artifacts_dir TEXT')
     con.execute('''INSERT INTO sessions
           (session_id, name, dir, branch, base_sha, head_sha, status, summary_path,
-           created_at, updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?)
+           artifacts_dir, created_at, updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(session_id) DO UPDATE SET
           name=excluded.name, dir=excluded.dir, branch=excluded.branch,
           base_sha=excluded.base_sha, head_sha=excluded.head_sha,
           status=excluded.status, summary_path=excluded.summary_path,
-          updated_at=excluded.updated_at''',
+          artifacts_dir=excluded.artifacts_dir, updated_at=excluded.updated_at''',
         (session_id, name, resume_dir, branch, base_sha, head_sha, status,
-         summary_path, now, now))
+         summary_path, artifacts_dir, now, now))
     con.commit()
 finally:
     con.close()

@@ -197,6 +197,27 @@ The top-level agent is told all this via the seeded global `CLAUDE.md` (a
 "Parallel worktree subagents" section), so it fans out correctly without
 re-installing deps or reaching for the network mid-run.
 
+## Linked local dependencies (linker)
+
+For poly-repos that link to each other locally (the `~/hyper` pattern), the
+sandbox integrates [`linker`](../../dev/linker) — a declarative `npm link`
+substitute. A repo's `links.json` pins each local dependency to a sha; the same
+`post-checkout` hook that hydrates `node_modules` also runs
+`linker load --worktree --branch <the-worktree's-branch>`, so every linked dep
+becomes a **worktree pinned to its declared sha, isolated to that worktree's
+branch**, symlinked into `node_modules`. Two parallel sessions therefore get
+independent worktrees of a shared dep instead of fighting over one checkout, and
+the whole thing stays offline (the deps are already under the mount).
+
+`linker` isn't published yet, so it's **mounted in from the host** rather than
+baked into the image: csandbox mounts the host `linker` package at `/opt/linker`
+(with a wrapper on `PATH`) plus the host `~/.linker/registry.json` (name→path).
+Host paths resolve in-container because the workspace mounts at the same path.
+This is best-effort — if `linker` isn't on the host `PATH`, the sandbox just
+skips it (no links wired). The agent is told it's automatic via a seeded
+"Linked local dependencies" `CLAUDE.md` section (only added when linker is
+active).
+
 ---
 
 ## Setup / installation
@@ -209,6 +230,10 @@ docker compose -f ~/hyper/claude-sandbox/docker-compose.yml -p claude-sandbox bu
 
 # 2. put the launcher on PATH
 ln -sf ~/hyper/claude-sandbox/csandbox ~/.local/bin/csandbox
+
+# 3. (optional) enable linked local deps: put linker on PATH, register repos
+cd ~/dev/linker && npm install && npm link
+linker register corestore ~/hyper/corestore   # once per local dep
 ```
 
 Requires: Docker with the Compose plugin. On first launch, log the sandbox in

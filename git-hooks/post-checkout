@@ -34,4 +34,18 @@ if [ -n "${CSANDBOX_MANIFEST:-}" ]; then
 fi
 
 command -v wt-hydrate >/dev/null 2>&1 && wt-hydrate "$PWD" || true
+
+# Wire up declaratively-linked local deps (linker), isolated to this worktree.
+# If the worktree root declares a links.json, replace its node_modules links
+# with worktrees of each dep pinned to the sha in links.json, on THIS worktree's
+# branch - so parallel sessions/subagents stay isolated. Runs after hydrate so
+# it overwrites any stale symlinks the CoW clone brought over. Each dep worktree
+# re-fires this hook, so the link graph is applied transitively; the reuse path
+# (an existing worktree -> plain checkout, real prev-HEAD) stops any cycle.
+# Network-quiet: the deps are all local under the mount with full history.
+if [ -f "$PWD/links.json" ] && command -v linker >/dev/null 2>&1; then
+  branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  linker load --worktree ${branch:+--branch "$branch"} >&2 \
+    || echo "post-checkout: linker load failed (continuing)" >&2
+fi
 exit 0
