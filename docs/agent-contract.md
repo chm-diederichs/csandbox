@@ -27,6 +27,12 @@ The agent (told this via the seeded `CLAUDE.md`) must:
 1. **Work on the session's worktree branch and commit its code.** A commit is
    what produces a reviewable diff (`base..head`). Uncommitted working-tree
    changes are invisible to branch-diff review, so finish by committing.
+   **Write the *why* in the commit message** — `git log` is how the next
+   (ephemeral or caught-up) session on this branch reconstructs what happened
+   while it was absent (see catch-up in `review-loop.md`). A terse message loses
+   context that then costs tokens to re-derive. Verbosity here is fine: these are
+   WIP branch commits and the human **squashes them into a clean message when
+   landing to `main`**, so the branch log stays rich without bloating `main`.
 2. **Always write a summary** to the path in `$CSANDBOX_SUMMARY` — *even if it
    committed nothing* (got stuck, or was only fact-finding). The summary is how
    a no-diff session is still reviewable.
@@ -65,9 +71,17 @@ The agent (told this via the seeded `CLAUDE.md`) must:
 
 - **agent → reviewer:** the summary `.md`. Session-level, not line-anchored —
   the diff already shows the lines; the summary explains the why and the caveats.
-- **reviewer → agent:** line-anchored comments in the review UI (diffx), compiled
-  into the resume prompt. This is where line-level precision lives, so the agent
-  never needs to embed it in code.
+- **reviewer → agent:** line-anchored comments, compiled into the resume prompt.
+  This is where line-level precision lives, so the agent never needs to embed it
+  in code.
+
+Note the *role*, not the actor. This rule binds the **reviewee** (an agent
+reporting *its own* work → summary only). A **reviewer** — human *or* agent —
+emits the line-anchored comments. So an agent reviewing *another* branch (e.g.
+the top-level agent gating a subagent's work) writing line comments is not a
+violation; it's the reviewer role. The comment channel is an append-only
+`comments.jsonl` per session — see [`review-loop.md`](./review-loop.md) for the
+event model, the `{repo, branch}` keying, and how comments compile into resumes.
 
 ## DB / status implications
 
