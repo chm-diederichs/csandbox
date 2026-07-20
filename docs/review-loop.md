@@ -322,8 +322,9 @@ The full human loop is now wired: `review`/`comment` → `comments.jsonl` →
 A zero-build local web app (node `http` + a self-contained page; shared core
 extracted to `csandbox-review/lib.js`, used by both the CLI and the server):
 
-- **Session tree** — sessions + their worktree branches (subagent tree), read
-  live from the tasks db + `worktrees.jsonl`, with open-comment counts.
+- **Session tree** — sessions grouped under their root repo (collapsible), each
+  showing its worktree branches (subagent tree), read live from the tasks db +
+  `worktrees.jsonl`, with open-comment counts.
 - **Land (squash-merge)** — the *land* PR, distinct from the *review* loop: show
   a branch's diff, edit a GitHub-style default message (session name + bulleted
   commit subjects), `git merge --squash` onto the main worktree's current branch,
