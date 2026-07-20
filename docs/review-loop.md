@@ -317,6 +317,23 @@ The full human loop is now wired: `review`/`comment` → `comments.jsonl` →
   the SUMMARY/MANIFEST no-per-session-path gap);
 - scratch retention/prune policy (now one more file per session).
 
+## Web app (BUILT — `csreview serve`)
+
+A zero-build local web app (node `http` + a self-contained page; shared core
+extracted to `csandbox-review/lib.js`, used by both the CLI and the server):
+
+- **Session tree** — sessions + their worktree branches (subagent tree), read
+  live from the tasks db + `worktrees.jsonl`, with open-comment counts.
+- **Land (squash-merge)** — the *land* PR, distinct from the *review* loop: show
+  a branch's diff, edit a GitHub-style default message (session name + bulleted
+  commit subjects), `git merge --squash` onto the main worktree's current branch,
+  then **destroy the session** (worktrees + branches + scratch + db row; work is
+  preserved in the squash commit). Non-interactive: refuses a dirty *tracked*
+  tree, and on conflict backs the half-merge out and hands off to the terminal.
+
+Deferred (design §UI): embedded terminal / live spawn, live tree updates (SSE),
+in-app conflict resolution.
+
 ## Adjacent systems (built, separate)
 
 - **Snapshot isolation** (`snapshot.json`, `csbox-enter-repo`) — freezes repo
