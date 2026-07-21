@@ -325,6 +325,10 @@ extracted to `csandbox-review/lib.js`, used by both the CLI and the server):
 - **Session tree** — sessions grouped under their root repo (collapsible), each
   showing its worktree branches (subagent tree), read live from the tasks db +
   `worktrees.jsonl`, with open-comment counts.
+- **Review** — click a diff line to add a comment (note/nit/warn/blocker);
+  open comments render inline. Writes the same `comments.jsonl` as the CLI/diffx,
+  so `resume` compiles them like any other. In-app commenting means diffx is
+  optional, not required, for the human review path.
 - **Land (squash-merge)** — the *land* PR, distinct from the *review* loop: show
   a branch's diff, edit a GitHub-style default message (session name + bulleted
   commit subjects), `git merge --squash` onto the main worktree's current branch,
