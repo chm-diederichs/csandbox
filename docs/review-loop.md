@@ -336,8 +336,25 @@ extracted to `csandbox-review/lib.js`, used by both the CLI and the server):
   preserved in the squash commit). Non-interactive: refuses a dirty *tracked*
   tree, and on conflict backs the half-merge out and hands off to the terminal.
 
-Deferred (design §UI): embedded terminal / live spawn, live tree updates (SSE),
-in-app conflict resolution.
+### UI-only mode (BUILT)
+
+You can drive a session end-to-end from the app, terminal optional:
+
+- **Chat** — a per-session conversation (read from the session transcript, minus
+  subagent `isSidechain` turns). Each message is a **background warm-resume `-p`
+  turn** (`POST /api/message`, `resumePlan` with `raw`): the session reloads its
+  transcript, replies, exits; the reply lands in the transcript. So chat,
+  review-comment-send, and new instructions are all **the same primitive** — a
+  warm-resume turn — differing only in the composed prompt.
+- **Send comments** — `POST /api/send` compiles a branch's open comments into a
+  warm-resume turn (the review framing).
+- **Liveness + guard** — csandbox writes a `running` tasks-db row at spawn; the
+  app shows it, polls, and **refuses merge/destroy on a running session** unless
+  forced (fixes the destroy-a-live-session footgun).
+
+The model is turn-granularity, not mid-turn injection: "live" = fast warm-resume
+turns + polling, no SDK/PTY. Interrupting a busy turn (SDK streaming input) and
+an embedded terminal remain deferred; in-app conflict resolution too.
 
 ## Adjacent systems (built, separate)
 
