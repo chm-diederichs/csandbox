@@ -498,6 +498,42 @@ compose build --quiet 2>/dev/null || compose build
 compose up -d proxy >/dev/null 2>&1
 SINCE="$(date -u +%Y-%m-%dT%H:%M:%S)"
 
+# Mark the session RUNNING in the tasks db up front (host-side; the container
+# can't reach the db). The review app uses this to show live sessions and to
+# refuse a merge/destroy on one. The post-run recorder flips it to ready/
+# summary_only on exit; a row stuck at 'running' means the container was killed
+# hard. Skipped for shell mode and picker runs (no id yet).
+if [ -n "$SESSION_ID" ] && [ "${CSANDBOX_SHELL:-}" != "1" ]; then
+  python3 - "$TASKS_DB" "$SESSION_ID" "$PROJECT_DIR" "$NAME" "$SCRATCH_DIR" <<'PY' 2>/dev/null || true
+import os, sqlite3, sys, time
+db, sid, pdir, name, scratch = sys.argv[1:6]
+adir = os.path.join(scratch, 'sessions', sid)
+adir = adir if os.path.isdir(adir) else ''
+now = int(time.time())
+con = sqlite3.connect(db, timeout=10)
+try:
+    con.execute('PRAGMA busy_timeout=5000')
+    con.execute('''CREATE TABLE IF NOT EXISTS sessions (
+        session_id TEXT PRIMARY KEY, name TEXT, dir TEXT, branch TEXT, base_sha TEXT,
+        head_sha TEXT, status TEXT, summary_path TEXT, artifacts_dir TEXT,
+        created_at INTEGER, updated_at INTEGER)''')
+    cols = [r[1] for r in con.execute('PRAGMA table_info(sessions)')]
+    for c in ('summary_path', 'name', 'artifacts_dir'):
+        if c not in cols:
+            con.execute('ALTER TABLE sessions ADD COLUMN %s TEXT' % c)
+    con.execute('''INSERT INTO sessions
+          (session_id, name, dir, status, artifacts_dir, created_at, updated_at)
+        VALUES (?,?,?,?,?,?,?)
+        ON CONFLICT(session_id) DO UPDATE SET
+          status='running', dir=excluded.dir, artifacts_dir=excluded.artifacts_dir,
+          name=COALESCE(excluded.name, sessions.name), updated_at=excluded.updated_at''',
+        (sid, name or None, pdir, 'running', adir or None, now, now))
+    con.commit()
+finally:
+    con.close()
+PY
+fi
+
 set +e
 compose run --rm \
   -v "$WORKSPACE_MOUNT" \
