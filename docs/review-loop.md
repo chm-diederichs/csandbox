@@ -336,25 +336,31 @@ extracted to `csandbox-review/lib.js`, used by both the CLI and the server):
   preserved in the squash commit). Non-interactive: refuses a dirty *tracked*
   tree, and on conflict backs the half-merge out and hands off to the terminal.
 
-### UI-only mode (BUILT)
+### Live review pane (BUILT) — the app's role
 
-You can drive a session end-to-end from the app, terminal optional:
+Decision (revised): **interaction happens in the Claude TUI** (native, streaming,
+interruptible); the web app is a **live diff-and-comment review pane** you keep
+open beside it. Chat / "send turn" were built then removed — the TUI does that
+better. Comments still flow app → `comments.jsonl` → agent (prompt now, auto
+"read your $CSANDBOX_COMMENTS" later).
 
-- **Chat** — a per-session conversation (read from the session transcript, minus
-  subagent `isSidechain` turns). Each message is a **background warm-resume `-p`
-  turn** (`POST /api/message`, `resumePlan` with `raw`): the session reloads its
-  transcript, replies, exits; the reply lands in the transcript. So chat,
-  review-comment-send, and new instructions are all **the same primitive** — a
-  warm-resume turn — differing only in the composed prompt.
-- **Send comments** — `POST /api/send` compiles a branch's open comments into a
-  warm-resume turn (the review framing).
-- **Liveness + guard** — csandbox writes a `running` tasks-db row at spawn; the
-  app shows it, polls, and **refuses merge/destroy on a running session** unless
-  forced (fixes the destroy-a-live-session footgun).
+- **Tree:** launch-repo (grouping, = `canonRepo(dir)`) → session → the repos it
+  touched on its **own** branch + **subagents** (grouped by their branch, each
+  with per-repo nodes). This needs the `{repo, branch}` keying: `manifestBranches`
+  dedups on `{repo, branch}` (a branch name recurs across repos via
+  csbox-enter-repo/linker), `branchNode(row, branch, repo)` disambiguates.
+- **Real-time diff:** poll the selected `{repo,branch}` head; re-render on change,
+  preserving scroll, and **paused while a comment form is open**.
+- **Multi-repo:** one reviewable node per `{repo, branch}` — all touched repos
+  show (fixes the earlier collapse-to-one-repo bug).
+- **Liveness + guard:** csandbox writes a `running` tasks-db row at spawn; the app
+  badges it and **refuses merge/destroy on a running session** unless forced.
+- **Finalize (secondary):** per-session button → land view. `mergeBranch` squash-
+  merges **one `{repo,branch}`** (no auto-destroy — a multi-repo session needs
+  several); `destroy` tears the whole session down afterward.
 
-The model is turn-granularity, not mid-turn injection: "live" = fast warm-resume
-turns + polling, no SDK/PTY. Interrupting a busy turn (SDK streaming input) and
-an embedded terminal remain deferred; in-app conflict resolution too.
+Turn-granularity via the TUI, not app-side injection. Deferred: SDK streaming
+(mid-turn steer), embedded terminal, auto comment-pull, in-app conflict resolution.
 
 ## Adjacent systems (built, separate)
 
