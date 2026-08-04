@@ -68,10 +68,12 @@ fi
 # pull csandbox's own flags out of the arg list; everything else goes to claude
 LIVE=0
 NAME=""
+FINDINGS="${CSANDBOX_FINDINGS:-0}"
 ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --live) LIVE=1; shift ;;
+    --findings) FINDINGS=1; shift ;;   # opt-in (test): mount the findings memory + telemetry
     --name) NAME="${2:-}"; shift 2 2>/dev/null || shift ;;   # human label for the review UI
     *)      ARGS+=("$1"); shift ;;
   esac
@@ -196,6 +198,21 @@ LINKER_CLI="$(command -v linker 2>/dev/null || true)"
 if [ -n "$LINKER_CLI" ]; then
   _ld="$(dirname "$(readlink -f "$LINKER_CLI")")"
   [ -f "$_ld/cli.js" ] && LINKER_DIR="$_ld"
+fi
+
+# Detect the host findings tool (external queryable memory; opt-in via --findings).
+# Like linker, an unpublished host tool mounted in rather than baked into the image.
+# Only resolved when the flag is set, so nothing about findings touches a normal run.
+FINDINGS_DIR=""
+if [ "$FINDINGS" = 1 ]; then
+  _fcli="$(command -v findings 2>/dev/null || true)"
+  if [ -n "$_fcli" ]; then
+    _fd="$(dirname "$(readlink -f "$_fcli")")"
+    [ -f "$_fd/cli.js" ] && FINDINGS_DIR="$_fd"
+  fi
+  _fdefault="${CSANDBOX_FINDINGS_DIR:-$HOME/dev/findings}"
+  [ -z "$FINDINGS_DIR" ] && [ -f "$_fdefault/cli.js" ] && FINDINGS_DIR="$_fdefault"
+  [ -z "$FINDINGS_DIR" ] && echo "csandbox: --findings set but the findings tool wasn't found (npm link it, or set CSANDBOX_FINDINGS_DIR)" >&2
 fi
 
 if [ ! -f "$CONFIG_DIR/CLAUDE.md" ] || ! grep -q '/home/node/scratch' "$CONFIG_DIR/CLAUDE.md"; then
@@ -382,6 +399,22 @@ if [ -n "$LINKER_DIR" ]; then
     && EXTRA_MOUNTS+=(-v "$HOME/.linker/registry.json:/home/node/.linker/registry.json:ro")
 fi
 
+# --- findings: external queryable memory (opt-in, --findings) -----------
+# Same mount-not-bake approach as linker: the CLI at /opt/findings + a wrapper on
+# PATH, plus a READ-WRITE ~/.findings store shared across sessions (the SQLite DB
+# and the telemetry trace). FINDINGS_EVENTS logs a recall/record trace so miss-rate
+# is measurable. All gated on --findings; a normal run mounts none of this.
+FINDINGS_EVENTS=""
+if [ -n "$FINDINGS_DIR" ]; then
+  FINDINGS_WRAPPER="$(dirname "$TASKS_DB")/findings-wrapper"
+  printf '#!/bin/sh\nexec node /opt/findings/cli.js "$@"\n' > "$FINDINGS_WRAPPER"
+  chmod +x "$FINDINGS_WRAPPER"
+  mkdir -p "$HOME/.findings"
+  EXTRA_MOUNTS+=(-v "$FINDINGS_DIR:/opt/findings:ro" -v "$FINDINGS_WRAPPER:/usr/local/bin/findings:ro")
+  EXTRA_MOUNTS+=(-v "$HOME/.findings:/home/node/.findings")   # rw: shared store + telemetry trace
+  FINDINGS_EVENTS="/home/node/.findings/events.jsonl"
+fi
+
 # --- secret scrubbing -------------------------------------------------
 # Shadow known secret-shaped files under the mounted root with an empty
 # read-only file inside the container. The host files are never touched -
@@ -473,6 +506,13 @@ else
     CLAUDE_ENV+=(CSANDBOX_LIVE=1)
     CLAUDE_ARGS+=(--append-system-prompt "This session was launched with csandbox --live: do NOT call EnterWorktree or move work onto a separate branch or worktree at startup. Edit the checked-out working tree directly - the user has deliberately chosen to work live over their current tree. This overrides the Top-level session worktree guidance in CLAUDE.md.")
   fi
+  if [ -n "$FINDINGS_DIR" ]; then
+    CLAUDE_ENV+=("FINDINGS_DB=/home/node/.findings/findings.db" "FINDINGS_EVENTS=$FINDINGS_EVENTS")
+    [ -n "$SESSION_ID" ] && CLAUDE_ENV+=("FINDINGS_SESSION=$SESSION_ID")
+    # ephemeral (per-run) guidance - NOT written to the persistent CLAUDE.md, so
+    # it never leaks into non --findings runs. Same mechanism as --live above.
+    CLAUDE_ARGS+=(--append-system-prompt "An external 'findings' memory (a shared cross-session store) is available this session. Before investigating anything non-trivial, run 'findings recall <terms>' first - a past session may have already worked it out. When you learn something durable that isn't obvious from the code (a mechanism or gotcha, a decision and why, or a fact about the user/environment), record it with 'findings record'. Full usage guide: /opt/findings/skills/findings.md. This is opt-in test tooling - use it alongside your normal workflow.")
+  fi
   CMD=(env "${CLAUDE_ENV[@]}" claude "${CLAUDE_ARGS[@]}" "$@")
 fi
 
@@ -480,6 +520,7 @@ fi
 echo "csandbox: mount $ROOT ($MOUNT_NOTE), $SCRUB_COUNT secret file(s) shadowed"
 echo "csandbox: egress allowlist -> $ALLOWED_DOMAINS"
 [ -n "$LINKER_DIR" ] && echo "csandbox: linker -> $LINKER_DIR (declarative local links wired per-worktree)"
+[ -n "$FINDINGS_DIR" ] && echo "csandbox: findings -> $FINDINGS_DIR (external memory at ~/.findings, telemetry on) [--findings]"
 [ "$LIVE" = 1 ] && echo "csandbox: --live -> agent edits the working tree directly (no top-level worktree)"
 
 # dry run: show resolved config and stop before touching docker
