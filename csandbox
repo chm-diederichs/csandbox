@@ -504,7 +504,7 @@ else
   [ ${#MINT_SESSION_ARGS[@]} -gt 0 ] && CLAUDE_ARGS+=("${MINT_SESSION_ARGS[@]}")
   if [ "$LIVE" = 1 ]; then
     CLAUDE_ENV+=(CSANDBOX_LIVE=1)
-    CLAUDE_ARGS+=(--append-system-prompt "This session was launched with csandbox --live: do NOT call EnterWorktree or move work onto a separate branch or worktree at startup. Edit the checked-out working tree directly - the user has deliberately chosen to work live over their current tree. This overrides the Top-level session worktree guidance in CLAUDE.md.")
+    CLAUDE_ARGS+=(--append-system-prompt "This session was launched with csandbox --live: work DIRECTLY in the checked-out working tree on its CURRENT branch, for the whole session. Do NOT create or switch to another branch or git worktree by ANY means - not EnterWorktree, not csbox-enter-repo, and not raw git (git worktree add / git checkout -b / git switch -c) - not at startup, not mid-session, and not to package a deliverable, review, or fix. If you commit, commit on the current branch. The user has deliberately chosen to work live on their current tree; this OVERRIDES all branch/worktree guidance in CLAUDE.md (the Top-level session worktree block, Crossing repos, and any review guidance).")
   fi
   if [ -n "$FINDINGS_DIR" ]; then
     CLAUDE_ENV+=("FINDINGS_DB=/home/node/.findings/findings.db" "FINDINGS_EVENTS=$FINDINGS_EVENTS")
