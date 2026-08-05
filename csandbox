@@ -54,7 +54,26 @@
 
 set -euo pipefail
 
-SANDBOX_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# --- portability shims (Linux + macOS) ------------------------------------
+# The container internals stay Linux; this is only the HOST-side launcher, which
+# must also run on a macOS host. macOS lacks `readlink -f` (older releases) and
+# `/proc`, so avoid both here.
+resolve () {  # portable `readlink -f`: follow a symlink chain by hand
+  local p="$1" t
+  while [ -L "$p" ]; do
+    t="$(readlink "$p")"                                  # no -f: one level, works on both
+    case "$t" in /*) p="$t" ;; *) p="$(cd "$(dirname "$p")" && pwd)/$t" ;; esac
+  done
+  printf '%s\n' "$p"
+}
+gen_uuid () {  # /proc is Linux-only; uuidgen is on both (macOS upper-cases it)
+  if [ -r /proc/sys/kernel/random/uuid ]; then cat /proc/sys/kernel/random/uuid
+  elif command -v uuidgen >/dev/null 2>&1; then uuidgen | tr '[:upper:]' '[:lower:]'
+  else python3 -c 'import uuid; print(uuid.uuid4())'
+  fi
+}
+
+SANDBOX_DIR="$(cd "$(dirname "$(resolve "${BASH_SOURCE[0]}")")" && pwd)"
 COMPOSE_FILE="$SANDBOX_DIR/docker-compose.yml"
 COMPOSE_PROJECT=claude-sandbox
 compose() { docker compose -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" "$@"; }
@@ -82,7 +101,7 @@ set -- "${ARGS[@]+"${ARGS[@]}"}"
 
 # first arg is the project dir if it's a directory, otherwise default to cwd
 if [ $# -gt 0 ] && [ -d "$1" ]; then
-  PROJECT_DIR="$(realpath "$1")"
+  PROJECT_DIR="$(cd "$1" && pwd -P)"
   shift
 else
   PROJECT_DIR="$PWD"
@@ -91,7 +110,7 @@ fi
 # workspace root: explicit override > ~/hyper (if the project is inside it,
 # so cross-repo npm links resolve) > the project dir itself
 if [ -n "${CSANDBOX_ROOT:-}" ]; then
-  ROOT="$(realpath "$CSANDBOX_ROOT")"
+  ROOT="$(cd "$CSANDBOX_ROOT" && pwd -P)"
 elif [[ "$PROJECT_DIR" == "$HOME/hyper/"* ]]; then
   ROOT="$HOME/hyper"
 else
@@ -125,7 +144,7 @@ for a in "$@"; do
   _prev="$a"
 done
 if [ -z "$SESSION_ID" ] && [ "$_has_session_flag" = 0 ] && [ "${CSANDBOX_SHELL:-}" != "1" ]; then
-  SESSION_ID="$(cat /proc/sys/kernel/random/uuid)"
+  SESSION_ID="$(gen_uuid)"
   MINT_SESSION_ARGS=(--session-id "$SESSION_ID")
 fi
 
@@ -196,7 +215,7 @@ fi
 LINKER_DIR=""
 LINKER_CLI="$(command -v linker 2>/dev/null || true)"
 if [ -n "$LINKER_CLI" ]; then
-  _ld="$(dirname "$(readlink -f "$LINKER_CLI")")"
+  _ld="$(dirname "$(resolve "$LINKER_CLI")")"
   [ -f "$_ld/cli.js" ] && LINKER_DIR="$_ld"
 fi
 
@@ -207,7 +226,7 @@ FINDINGS_DIR=""
 if [ "$FINDINGS" = 1 ]; then
   _fcli="$(command -v findings 2>/dev/null || true)"
   if [ -n "$_fcli" ]; then
-    _fd="$(dirname "$(readlink -f "$_fcli")")"
+    _fd="$(dirname "$(resolve "$_fcli")")"
     [ -f "$_fd/cli.js" ] && FINDINGS_DIR="$_fd"
   fi
   _fdefault="${CSANDBOX_FINDINGS_DIR:-$HOME/dev/findings}"
