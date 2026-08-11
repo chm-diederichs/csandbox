@@ -70,7 +70,8 @@ finding
   area                     -- one coarse topical tag (freeform)
   claim                    -- the one-line assertion (required; what ranks + lists)
   report                   -- full markdown evidence/detail (free-form)
-  files         json[]     -- observations only: paths the claim concerns (staleness + scope)
+  files         json[]     -- anchor/scope: paths the claim concerns (observation staleness).
+                           --   ["*"] = repo-global (repo-wide decisions). future: symbol anchors (§Staleness)
   thread                   -- investigation/exploration grouping; a resolution absorbs it
   role                     -- normal | resolution
   status                   -- open | confirmed | absorbed | superseded | stale
@@ -167,29 +168,57 @@ thread T:  F1 open · F2 open · F3 confirmed   -- linked by thread=T
 - Default retrieval: `confirmed` (incl. resolutions); `open` shown-but-tentative;
   `stale` flagged "verify".
 
-## Staleness (reuse the catch-up idea) — category-dependent
+## Staleness — change-based, not wall-clock; per-kind
 
-Applies to **observations only.** A claim is valid "as-of `anchor_sha`, in
-`files`"; a querying session checks whether `files` changed since `anchor_sha`
-(`git log <anchor_sha>..HEAD -- files`) and surfaces **"verify before trusting"**
-if so — advisory, not hard invalidation (the agent judges; a mechanism/invariant
-may survive a file edit a line-level detail wouldn't).
+Staleness asks "has the ground under this claim moved?" — a **change** signal,
+never elapsed time. A finding untouched for a year is fine if nothing relevant
+changed; one recorded an hour ago is suspect if its area churned since. Two
+mechanisms, split by kind:
 
-**Decisions and memories don't stale on file edits** — they stand until an
-explicit later assertion `supersede`s them (memories may also carry a soft
-`expires_ts` for context-bound facts). No `anchor_sha`; corroboration means
-"reaffirmed / still in force" (`verified` is meaningful only for observations).
-A decision's exploration→decision arc uses the same graph: option-analysis
-`open` findings in a `thread` resolve into a `decision` (`role: resolution`) that
-absorbs them. And a user-authored **memory that is a code claim** can be
-*promoted* to an observation once a session verifies it (it then gains a `sha`
-anchor and starts code-staling).
+**Observations — git diff over the anchor (CORE, ground truth).** A claim is
+valid "as-of `anchor_sha`, in `files`"; a querying session checks whether the
+anchor changed (`git log <anchor_sha>..HEAD -- files`) and surfaces **"verify
+before trusting"** if so — advisory, not hard invalidation (a mechanism/invariant
+may survive an edit a line-level detail wouldn't). This is the precise,
+ground-truth check; it stays the answer for observations.
+
+**Decisions and memories — churn counter (DEFERRED).** Not code-verifiable, so
+git-diff doesn't apply; today they only stale on explicit `supersede`, so a
+decision can quietly rot as its area churns with *no signal at all*. Fill that
+gap with a **scalar churn counter per `(repo, area)`** — a logical/version clock,
+NOT wall-clock: each run that touches the area increments it; stamp findings with
+`count_at_record`; at recall, `count_now − count_at_record` is an advisory "this
+area has moved N times since — re-affirm" signal. Same advisory nature as the git
+check (it prioritises a re-check; a touch can also *reinforce* a claim, so it
+never asserts wrongness). The hard part is **attribution** — which run touched
+which area (self-report is noisy; file-derived needs a file→area map); that cost
+is why it's deferred until decision/memory staleness shows up as a real miss
+source. This reframes the old wall-clock "age-out by inactivity" (§Curation) as
+churn-based.
+
+**Anchor / scope granularity** (coarse → fine): `["*"]` **repo-global** (a
+repo-wide decision — churn measured at repo level) · `area` topical bucket (the
+churn counter's unit) · **file paths** (observation git-diff, CORE) · **symbol
+anchors** (fn/class/method — DEFERRED, the finest). Symbol anchoring is the most
+staleness-resistant: it survives the renames/moves/file-splits that break
+path-anchoring, is more precise (a finding about `parseHeader` isn't staled by
+edits to `parseBody` in the same file), and self-prunes (symbol gone → finding
+obsolete). Cost: needs a symbol index (tree-sitter / ctags / LSP) to locate and
+diff a symbol across moves — hence deferred; adopt if path-level staleness proves
+too brittle or noisy under refactors.
+
+Wall-clock survives only as the optional soft `expires_ts` for genuinely
+context-bound memories ("current priority is X"). A user-authored **memory that
+is a code claim** still *promotes* to an observation once verified (gains a `sha`
+anchor, starts code-staling); the exploration→decision arc still resolves
+`open` option-analysis findings into a `decision` (`role: resolution`).
 
 ## Curation
 
 Mostly the lifecycle (resolution absorbs; supersede replaces). Residual leak:
 **abandoned threads** — `open` findings whose investigation never resolved.
-Age-out by thread inactivity (demote after N days of no new events). Hard-prune
+Age-out by thread inactivity — prefer the churn counter (§Staleness) as the
+inactivity measure over wall-clock "N days". Hard-prune
 `absorbed`/`superseded`/aged only if size demands; default is soft.
 
 ## Storage + access
@@ -298,6 +327,43 @@ inject context, and they're easy to get wrong. Captured so we don't re-plan:
 Net: caching doesn't change the ephemeral verdict, but the injected-context
 discipline — **frozen base + append-only** — is what keeps re-injection cheap
 rather than a hidden per-turn tax.
+
+## Distributed / decentralized (deferred — but reframes the choices above)
+
+The ephemeral-session premise is a *choice* on one machine; in a decentralized,
+multi-provider, pay-per-inference agent network it's the *environment*. No shared
+context window across providers → external retrievable memory is the only
+continuity substrate; every retrieval miss is literal re-derivation cost at a
+metered provider; concurrent agents need a shared, consistent knowledge layer. So
+this architecture stops being "wins in our niche" and becomes structurally
+necessary there.
+
+Three things that are DEFERRED locally become load-bearing in that setting:
+
+- **Corroboration + provenance move to the critical path.** Findings arrive from
+  heterogeneous agents/providers you don't control and can't assume are honest or
+  competent. Weight claims by *independent* corroboration (distinct origins),
+  carry provenance, and make the store Byzantine-tolerant — one bad agent must not
+  poison it (potentially reputation/stake-weighted). The DEFERRED corroboration
+  set is the seed of this.
+- **Logical clocks, not wall clock.** Across nodes there is no trustworthy global
+  time (skew, adversarial timestamps) — which independently confirms the
+  change-based staleness above. Two *different* clocks; do not conflate them:
+  - **staleness** → the scalar churn counter per `(repo, area)` (§Staleness):
+    "how much has this area moved since I learned this".
+  - **concurrency** → a true **vector clock keyed by agent/node**: establishes
+    causal order and detects *concurrent conflicting claims* (two agents recorded
+    about the same topic without seeing each other → reconcile, don't silently
+    last-write-wins). This is where "vector clock" earns the name — a consistency
+    tool, distinct from the staleness counter.
+- **Model-agnostic by construction.** Findings are plain-text claims, so any
+  model/agent at any provider can read/write them — the reason the scheme
+  generalises past a single harness (cf. the sandbox-ownership question: own the
+  boundary + the memory substrate, rent the mechanism).
+
+Build none of this until a distributed/multi-agent setting is actually live;
+captured here so the CORE (mutable rows, the `corroboration` set, `area`) doesn't
+foreclose it.
 
 ## Adjacent / reuse
 
