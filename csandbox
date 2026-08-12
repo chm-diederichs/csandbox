@@ -87,12 +87,14 @@ fi
 # pull csandbox's own flags out of the arg list; everything else goes to claude
 LIVE=0
 NAME=""
-FINDINGS="${CSANDBOX_FINDINGS:-0}"
+FINDINGS="${CSANDBOX_FINDINGS:-1}"   # external memory: on by default; --no-findings / CSANDBOX_FINDINGS=0 disables
+FINDINGS_EXPLICIT=0                    # set by --findings; warn only then if the tool is missing
 ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --live) LIVE=1; shift ;;
-    --findings) FINDINGS=1; shift ;;   # opt-in (test): mount the findings memory + telemetry
+    --findings) FINDINGS=1; FINDINGS_EXPLICIT=1; shift ;;   # explicit on (already the default)
+    --no-findings) FINDINGS=0; shift ;;                     # opt out of the findings memory
     --name) NAME="${2:-}"; shift 2 2>/dev/null || shift ;;   # human label for the review UI
     *)      ARGS+=("$1"); shift ;;
   esac
@@ -219,9 +221,10 @@ if [ -n "$LINKER_CLI" ]; then
   [ -f "$_ld/cli.js" ] && LINKER_DIR="$_ld"
 fi
 
-# Detect the host findings tool (external queryable memory; opt-in via --findings).
-# Like linker, an unpublished host tool mounted in rather than baked into the image.
-# Only resolved when the flag is set, so nothing about findings touches a normal run.
+# Detect the host findings tool (external queryable memory; ON BY DEFAULT,
+# --no-findings to disable). Like linker, an unpublished host tool mounted in
+# rather than baked into the image. If it isn't installed we silently skip
+# (findings just isn't active that run) unless the user explicitly asked.
 FINDINGS_DIR=""
 if [ "$FINDINGS" = 1 ]; then
   _fcli="$(command -v findings 2>/dev/null || true)"
@@ -231,7 +234,7 @@ if [ "$FINDINGS" = 1 ]; then
   fi
   _fdefault="${CSANDBOX_FINDINGS_DIR:-$HOME/dev/findings}"
   [ -z "$FINDINGS_DIR" ] && [ -f "$_fdefault/cli.js" ] && FINDINGS_DIR="$_fdefault"
-  [ -z "$FINDINGS_DIR" ] && echo "csandbox: --findings set but the findings tool wasn't found (npm link it, or set CSANDBOX_FINDINGS_DIR)" >&2
+  [ -z "$FINDINGS_DIR" ] && [ "$FINDINGS_EXPLICIT" = 1 ] && echo "csandbox: --findings set but the findings tool wasn't found (npm link it, or set CSANDBOX_FINDINGS_DIR)" >&2
 fi
 
 if [ ! -f "$CONFIG_DIR/CLAUDE.md" ] || ! grep -q '/home/node/scratch' "$CONFIG_DIR/CLAUDE.md"; then
@@ -418,11 +421,11 @@ if [ -n "$LINKER_DIR" ]; then
     && EXTRA_MOUNTS+=(-v "$HOME/.linker/registry.json:/home/node/.linker/registry.json:ro")
 fi
 
-# --- findings: external queryable memory (opt-in, --findings) -----------
+# --- findings: external queryable memory (on by default; --no-findings) -----
 # Same mount-not-bake approach as linker: the CLI at /opt/findings + a wrapper on
 # PATH, plus a READ-WRITE ~/.findings store shared across sessions (the SQLite DB
 # and the telemetry trace). FINDINGS_EVENTS logs a recall/record trace so miss-rate
-# is measurable. All gated on --findings; a normal run mounts none of this.
+# is measurable. Active whenever the tool was detected; --no-findings opts out.
 FINDINGS_EVENTS=""
 if [ -n "$FINDINGS_DIR" ]; then
   FINDINGS_WRAPPER="$(dirname "$TASKS_DB")/findings-wrapper"
@@ -539,7 +542,7 @@ fi
 echo "csandbox: mount $ROOT ($MOUNT_NOTE), $SCRUB_COUNT secret file(s) shadowed"
 echo "csandbox: egress allowlist -> $ALLOWED_DOMAINS"
 [ -n "$LINKER_DIR" ] && echo "csandbox: linker -> $LINKER_DIR (declarative local links wired per-worktree)"
-[ -n "$FINDINGS_DIR" ] && echo "csandbox: findings -> $FINDINGS_DIR (external memory at ~/.findings, telemetry on) [--findings]"
+[ -n "$FINDINGS_DIR" ] && echo "csandbox: findings -> $FINDINGS_DIR (external memory at ~/.findings, telemetry on; --no-findings to disable)"
 [ "$LIVE" = 1 ] && echo "csandbox: --live -> agent edits the working tree directly (no top-level worktree)"
 
 # dry run: show resolved config and stop before touching docker
