@@ -4,8 +4,7 @@ Status: **design; not built. Trimmed to a CORE to build first + DEFERRED
 machinery kept below** (see "Build scope"). An external, queryable memory so
 sessions can be **ephemeral** (small, focused, cheap) instead of long-lived
 multi-repo transcripts. Each session records distilled findings; later sessions
-retrieve the relevant slice on demand (via a per-worktree `PLANNING.md` index +
-`recall`).
+retrieve the relevant slice on demand (via `recall`).
 
 Motivation: long-lived sessions spanning several repos bloat context, hit
 (lossy) compaction, and degrade. External memory moves cost from *carrying
@@ -117,27 +116,31 @@ skill **recalls first**: if a matching claim exists → `corroborate` or
 `supersede` it; else insert. This is the dedup mechanism — without it, live
 per-insight from many sessions produces cross-session duplicates.
 
-## PLANNING.md — per-worktree recall index (core)
+## PLANNING.md — dropped from core (= the task-queue context slice)
 
-The DB is canonical, but agents shouldn't have to query it well every time. Each
-worktree gets a **`PLANNING.md`** — a thin, worktree-scoped **index over the DB**
-for this line of work: a list of relevant finding `id`s, each with a one-line
-"why it matters here", plus minimal local task notes. It is **not** a source of
-truth and does **not** duplicate finding content — it *references* it.
+**Decision (2026-08): not built as a standalone mechanism; the skill mention was
+removed.** The idea was a per-worktree curated index of relevant finding `id`s —
+start a session from a pre-curated slice instead of a cold query, to cut
+miss-rate. Two things killed it as a standalone piece:
 
-This is exactly the `MEMORY.md`→memory-files pattern at worktree scope. Its whole
-job is to **cut miss-rate**: a session starts by reading `PLANNING.md` (the
-pre-curated slice) rather than relying on a cold query, and falls back to
-`recall` for anything not indexed.
+- **Worktree scope defeats the purpose.** csandbox worktrees are ephemeral, so a
+  worktree-scoped file dies with the worktree and re-derives every session — the
+  opposite of the cross-session continuity it was meant to give. The index has to
+  key on the durable *line of work*, not the physical worktree.
+- **That durable index IS the task-queue entry.** "A line of work → its worktree +
+  relevant finding ids + notes" is exactly the deferred task-queue record — the
+  same mechanism under two names. Building a separate rotting markdown file now
+  would just be duplicated machinery the task queue later replaces.
 
-Why this avoids the "in-repo doc rots" problem you get from a hand-maintained
-design file:
-- **pointers, not prose** — stays short; content lives in (and freshens from) the
-  DB, so a superseded finding shows as superseded when you follow the link.
-- **gitignored working file** — worktree-scoped, dies with the worktree, never
-  reaches `main`, never bloats history.
-- as findings are recorded, the agent adds a pointer here if it's relevant to
-  this worktree — cheap, append-ish, low contention.
+A lightweight `findings plan <ids>` (bind a plan/session id to findings + a
+reverse index) was considered and **rejected as redundant** with the existing
+relations: `thread` already groups an investigation, and FTS + `repo`/`area` +
+supersede chains cover cross-linking.
+
+**So:** rely on session-start `recall` (+ the agent nudge) for now. If miss-rate
+telemetry shows cold recall degrading at scale, build the durable index **once,
+as the task queue's context slice** — DB-rendered (superseded findings show as
+superseded), keyed to the task, not a separate file.
 
 ## Corroboration + confidence — self-reinforcing (DEFERRED)
 
@@ -254,7 +257,9 @@ dup-rate**, and let observed failures earn each deferred piece.
   FTS + two-stage abstracts→reports), `supersede`.
 - The one staleness rule: **observations** flag "verify" if `files` changed since
   `sha`; decisions/memories are supersede-only.
-- **`PLANNING.md`** per-worktree recall index (above).
+- ~~`PLANNING.md` per-worktree recall index~~ — **dropped from core** (it's the
+  task-queue context slice, not a separate file; see the PLANNING.md section).
+  Session-start `recall` covers it until miss-rate data earns a durable index.
 
 **DEFERRED (documented above; add when a metric demands it):**
 - corroboration *set* + `verified` + confidence (self-reinforcing) — when
@@ -280,8 +285,11 @@ complete it, and record new findings back — closing the loop.
 
 This is the piece that makes ephemeral sessions fully autonomous: **findings =
 shared memory, tasks = shared work queue with pointers into that memory.**
-`PLANNING.md` is the per-worktree precursor (a hand-curated index for one line of
-work); a task queue generalizes it to cross-session, agent-dispatchable units.
+The durable "line of work → worktree + relevant finding ids + notes" index —
+originally sketched as a per-worktree `PLANNING.md` — **is this task record**;
+they were the same mechanism, so PLANNING.md was dropped rather than built
+separately (see its section). The task queue is its cross-session,
+agent-dispatchable form.
 
 Build order is unchanged: **findings DB core first, measure miss-rate/dup-rate,
 then tasks.** The task layer only pays off once retrieval is good enough that an
@@ -306,10 +314,10 @@ inject context, and they're easy to get wrong. Captured so we don't re-plan:
   of that turn's tool loop (read ≈0.1× input). We don't re-pay to hold it across
   loop steps.
 - **Append-only wins; editing kills.** Any byte change *anywhere* in the prefix
-  invalidates everything after it. So: keep the injected base (the `PLANNING.md`
-  slice) **frozen for the session**; let new findings **append** (as tool
+  invalidates everything after it. So: keep the injected base (the curated
+  finding slice) **frozen for the session**; let new findings **append** (as tool
   results, or a `role:"system"` message appended to `messages[]` on Opus 4.8);
-  persist `PLANNING.md` edits to disk for the **next** session, not the current
+  persist any changes to that slice for the **next** session, not the current
   prefix. Mutating injected context mid-session re-processes everything after the
   edit at full price.
 - **DB ≠ cache — different layers, different timescales.** DB = durable,
