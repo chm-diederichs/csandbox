@@ -388,8 +388,12 @@ for rule in ('Bash(*)', 'Edit', 'Write', 'WebFetch', 'WebSearch',
 # file inside the mount but outside the project dir would trigger the
 # "outside working directory" trust prompt. Grant the whole mount root as an
 # additional directory (file access only - no config side-loading, unlike
-# --add-dir). Set to exactly [root] each launch so it tracks the current mount.
-perms['additionalDirectories'] = [root]
+# --add-dir). Set to [root] + the scratch mount each launch. Scratch
+# (/home/node/scratch) is a SEPARATE mount outside root where agents keep working
+# copies (CLAUDE.md points them there, away from the protected .claude namespace),
+# so it must be trusted too — otherwise every read/write under scratch triggers
+# the trust prompt once bypass mode is unavailable (the org-policy case above).
+perms['additionalDirectories'] = [root, '/home/node/scratch']
 # EnterWorktree (called at session start per the "Top-level session worktree"
 # CLAUDE.md guidance) branches from the current commit rather than the default
 # branch. setdefault so this is only a seeded default - a user customization is
