@@ -76,7 +76,8 @@ gen_uuid () {  # /proc is Linux-only; uuidgen is on both (macOS upper-cases it)
 SANDBOX_DIR="$(cd "$(dirname "$(resolve "${BASH_SOURCE[0]}")")" && pwd)"
 COMPOSE_FILE="$SANDBOX_DIR/docker-compose.yml"
 COMPOSE_PROJECT=claude-sandbox
-compose() { docker compose -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" "$@"; }
+COMPOSE_FILE_ARGS=(-f "$COMPOSE_FILE")   # extra -f overrides appended below (e.g. --open-egress)
+compose() { docker compose "${COMPOSE_FILE_ARGS[@]}" -p "$COMPOSE_PROJECT" "$@"; }
 
 # teardown shortcut
 if [ "${CSANDBOX_DOWN:-}" = "1" ]; then
@@ -89,17 +90,25 @@ LIVE=0
 NAME=""
 FINDINGS="${CSANDBOX_FINDINGS:-1}"   # external memory: on by default; --no-findings / CSANDBOX_FINDINGS=0 disables
 FINDINGS_EXPLICIT=0                    # set by --findings; warn only then if the tool is missing
+OPEN_EGRESS=0                          # --open-egress: direct unfiltered route out (UDP/P2P), bypasses the allowlist
 ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --live) LIVE=1; shift ;;
     --findings) FINDINGS=1; FINDINGS_EXPLICIT=1; shift ;;   # explicit on (already the default)
     --no-findings) FINDINGS=0; shift ;;                     # opt out of the findings memory
+    --open-egress) OPEN_EGRESS=1; shift ;;                  # DIRECT unfiltered egress (UDP/P2P); bypasses the proxy allowlist
     --name) NAME="${2:-}"; shift 2 2>/dev/null || shift ;;   # human label for the review UI
     *)      ARGS+=("$1"); shift ;;
   esac
 done
 set -- "${ARGS[@]+"${ARGS[@]}"}"
+
+# --open-egress: layer in the override that also attaches the sandbox to the
+# `egress` bridge, giving it a DIRECT route to the internet (all TCP + UDP) for
+# workloads the HTTP-only proxy can't serve (e.g. UDP P2P / holepunch). This is a
+# deliberate loosening of the isolation for the session; the launch banner warns.
+[ "$OPEN_EGRESS" = 1 ] && COMPOSE_FILE_ARGS+=(-f "$SANDBOX_DIR/docker-compose.open-egress.yml")
 
 # first arg is the project dir if it's a directory, otherwise default to cwd
 if [ $# -gt 0 ] && [ -d "$1" ]; then
@@ -547,6 +556,7 @@ echo "csandbox: mount $ROOT ($MOUNT_NOTE), $SCRUB_COUNT secret file(s) shadowed"
 echo "csandbox: egress allowlist -> $ALLOWED_DOMAINS"
 [ -n "$LINKER_DIR" ] && echo "csandbox: linker -> $LINKER_DIR (declarative local links wired per-worktree)"
 [ -n "$FINDINGS_DIR" ] && echo "csandbox: findings -> $FINDINGS_DIR (external memory at ~/.findings, telemetry on; --no-findings to disable)"
+[ "$OPEN_EGRESS" = 1 ] && echo "csandbox: --open-egress -> DIRECT unfiltered egress this session (all TCP+UDP); the proxy allowlist is NOT a hard boundary (well-behaved HTTP still prefers the proxy)"
 [ "$LIVE" = 1 ] && echo "csandbox: --live -> agent edits the working tree directly (no top-level worktree)"
 
 # dry run: show resolved config and stop before touching docker

@@ -1,0 +1,18 @@
+# Opt-in override, layered in by `csandbox --open-egress`.
+#
+# It attaches the sandbox to the `egress` bridge as well as the routeless
+# `internal` network, giving the container a DIRECT route to the internet — all
+# TCP *and* UDP — for workloads the HTTP-only proxy cannot serve (UDP P2P:
+# holepunch / UDX / hyperdht, QUIC, etc.).
+#
+# SECURITY: this deliberately breaks the normal invariant ("the only way out is
+# the allowlisted proxy"). With a direct route present, the domain allowlist is
+# no longer a hard boundary. HTTP_PROXY/HTTPS_PROXY stay set, so well-behaved
+# HTTP(S) clients still go through the allowlisted proxy — but UDP and any client
+# that ignores the proxy env reach the internet directly and unfiltered. Use only
+# when you actually need non-HTTP egress, and only for that session.
+services:
+  sandbox:
+    networks:
+      - internal
+      - egress
