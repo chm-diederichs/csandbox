@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+#
+# bwrap-setup
+#
+# One-time, root-only, idempotent setup that lets csandbox's `bwrap` backend
+# (CSANDBOX_BACKEND=bwrap) function on this host. csandbox NEVER runs this
+# itself - it only checks whether it's been run and tells you to if not. Run
+# it yourself: `sudo ./bwrap-setup`.
+#
+# What it does, and why each part is needed:
+#
+# 1. AppArmor: grants /usr/bin/bwrap permission to create user namespaces.
+#    Ubuntu 24.04+ sets kernel.apparmor_restrict_unprivileged_userns=1, which
+#    blocks CLONE_NEWUSER for any process - confined or not - unless its
+#    AppArmor profile explicitly contains a `userns,` rule. bwrap ships no
+#    profile of its own, so unprivileged bwrap is entirely non-functional out
+#    of the box (verified on this host: even a bare `bwrap -- id` fails with
+#    "setting up uid map: Permission denied"). This is NOT the same as
+#    flipping the sysctl to 0, which would remove that protection for every
+#    process on the host - this grants the one specific binary the one
+#    specific permission it needs (`flags=(unconfined)` leaves bwrap
+#    otherwise unrestricted; it does its own sandboxing internally).
+#
+# 2. A persistent "csandbox.slice" systemd user slice, and an nft rule keyed
+#    on it that restricts its egress to the egress-proxy's loopback port
+#    only. Each csandbox bwrap run launches the sandboxed process via
+#    `systemd-run --user --scope --slice=csandbox`, which places it at a
+#    predictable cgroup path (.../user@<uid>.service/csandbox.slice/<run>.scope)
+#    without needing any root-side cgroup plumbing per run - these two steps
+#    are the one-time firewall rule that makes that placement actually mean
+#    something. The sandboxed process stays in the host's normal network
+#    namespace (no netns/veth/slirp4netns) - simpler, and just as effective
+#    for the actual goal: that process tree can reach the proxy and nothing
+#    else, including other localhost ports (so it can't reach your other
+#    local dev servers either).
+#
+#    nft's cgroupv2 match resolves the given path to the cgroup that exists
+#    at RULE-LOAD time - if "csandbox.slice" were a plain transient slice
+#    (auto-created and garbage-collected by systemd whenever no scope is
+#    currently using it), it would get a fresh cgroup - and therefore silently
+#    stop matching the nft rule - the next time it's recreated. Shipping a
+#    real (if empty) systemd unit file for it, the same way user.slice/
+#    system.slice are real units, keeps it from being garbage-collected
+#    between sessions, so the one nft rule loaded now keeps matching for good.
+#
+# Safe to re-run any time; every step replaces its prior state rather than
+# layering on top of it.
+set -euo pipefail
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "bwrap-setup: must run as root - re-run as: sudo $0" >&2
+  exit 1
+fi
+if [ -z "${SUDO_USER:-}" ]; then
+  echo "bwrap-setup: run via 'sudo $0' (not as a root login) - needs SUDO_USER to find your cgroup/AppArmor setup" >&2
+  exit 1
+fi
+
+PROXY_PORT="${CSANDBOX_PROXY_PORT:-8888}"
+
+command -v bwrap >/dev/null 2>&1 || { echo "bwrap-setup: bwrap (bubblewrap) is not installed - apt install bubblewrap" >&2; exit 1; }
+command -v nft >/dev/null 2>&1 || { echo "bwrap-setup: nft (nftables) is not installed - apt install nftables" >&2; exit 1; }
+command -v systemd-run >/dev/null 2>&1 || { echo "bwrap-setup: systemd-run not found - csandbox's bwrap backend needs a systemd user session" >&2; exit 1; }
+command -v apparmor_parser >/dev/null 2>&1 || { echo "bwrap-setup: apparmor_parser not found - apt install apparmor" >&2; exit 1; }
+
+# --- 1. AppArmor -----------------------------------------------------------
+PROFILE=/etc/apparmor.d/bwrap-csandbox
+cat > "$PROFILE" <<'EOF'
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap-csandbox /usr/bin/bwrap flags=(unconfined) {
+  userns,
+  include if exists <local/bwrap-csandbox>
+}
+EOF
+apparmor_parser -r "$PROFILE"
+echo "bwrap-setup: AppArmor profile loaded ($PROFILE) - bwrap can now create user namespaces"
+
+# --- 2. persistent "csandbox.slice" user slice ------------------------------
+REAL_UID="$(id -u "$SUDO_USER")"
+RUNTIME_DIR="/run/user/$REAL_UID"
+as_user() { sudo -u "$SUDO_USER" XDG_RUNTIME_DIR="$RUNTIME_DIR" "$@"; }
+
+SLICE_UNIT=/etc/systemd/user/csandbox.slice
+cat > "$SLICE_UNIT" <<'EOF'
+[Unit]
+Description=csandbox sandboxed sessions (persistent, so the csandbox nft egress rule keeps matching a stable cgroup)
+Before=shutdown.target
+EOF
+as_user systemctl --user daemon-reload
+as_user systemctl --user start csandbox.slice
+echo "bwrap-setup: persistent user slice installed and started ($SLICE_UNIT)"
+
+# --- 3. nft ------------------------------------------------------------------
+# nft's "cgroupv2 path" match needs the FULL path from the cgroupfs root (not
+# just the leaf slice name) to resolve at load time - the man page's own
+# example ("level 1 user.slice") only looks like a bare name because a
+# level-1 path has just one component. Ours is 4 components deep, so the
+# level-4 match string has to be the whole thing.
+CGROUP_PATH="user.slice/user-${REAL_UID}.slice/user@${REAL_UID}.service/csandbox.slice"
+CGROUP_LEVEL=4
+nft delete table inet csandbox 2>/dev/null || true
+nft -f - <<EOF
+table inet csandbox {
+  chain output {
+    type filter hook output priority filter; policy accept;
+    socket cgroupv2 level ${CGROUP_LEVEL} "${CGROUP_PATH}" tcp dport ${PROXY_PORT} ip daddr 127.0.0.1 accept
+    socket cgroupv2 level ${CGROUP_LEVEL} "${CGROUP_PATH}" drop
+  }
+}
+EOF
+echo "bwrap-setup: nft table 'inet csandbox' installed - csandbox.slice egress restricted to 127.0.0.1:${PROXY_PORT}"
+
+echo "bwrap-setup: done."
