@@ -3,14 +3,24 @@
 # csandbox [project-dir] [claude args...]
 #
 # Default launcher for running Claude Code with --dangerously-skip-permissions
-# inside a hardened Docker Compose sandbox:
-#   - the sandbox container has NO direct route to the internet; all egress
-#     must pass through the `proxy` sidecar, which only allows connections to
-#     an explicit domain allowlist (everything else gets a 403)
-#   - runs as the non-root `node` user (uid 1000), no added capabilities
-#   - the docker socket is never mounted
+# inside a hardened sandbox. Two backends (CSANDBOX_BACKEND, default docker):
+#
+#   docker (default) - Docker Compose: a sandbox container with NO direct
+#     route to the internet; all egress passes through the `proxy` sidecar,
+#     which only allows connections to an explicit domain allowlist.
+#
+#   bwrap - native Linux namespaces (bubblewrap), no daemon/image/build step.
+#     Same egress-proxy allowlist, enforced via an nft rule scoped to a
+#     dedicated cgroup instead of a separate container network. One-time
+#     root setup required first: `sudo ./bwrap-setup` (see that script's
+#     header for what it does and why). Linux-only; doesn't yet support
+#     --open-egress.
+#
+# Both backends share:
+#   - run as the non-root/unprivileged user, no added capabilities
 #   - known secret-shaped files under the mounted root are shadowed with an
-#     empty read-only file inside the container (host files are untouched)
+#     empty read-only file inside the sandbox (host files are untouched)
+#   - the same egress-proxy allowlist logic and profiles
 #
 # EGRESS ALLOWLIST
 #   The allowlist is built from three layers, unioned and deduped:
@@ -51,6 +61,7 @@
 #   csandbox --live .                            # edit the working tree directly (no worktree)
 #   CSANDBOX_DRYRUN=1 csandbox .                 # print resolved config & exit
 #   CSANDBOX_DOWN=1 csandbox                     # stop the proxy sidecar & exit
+#   CSANDBOX_BACKEND=bwrap csandbox .            # native-Linux bwrap backend
 
 set -euo pipefail
 
@@ -79,11 +90,69 @@ COMPOSE_PROJECT=claude-sandbox
 COMPOSE_FILE_ARGS=(-f "$COMPOSE_FILE")   # extra -f overrides appended below (e.g. --open-egress)
 compose() { docker compose "${COMPOSE_FILE_ARGS[@]}" -p "$COMPOSE_PROJECT" "$@"; }
 
+# --- backend selection ------------------------------------------------------
+BACKEND="${CSANDBOX_BACKEND:-docker}"
+case "$BACKEND" in
+  docker|bwrap) ;;
+  *) echo "error: unknown CSANDBOX_BACKEND '$BACKEND' (valid: docker, bwrap)" >&2; exit 1 ;;
+esac
+
+# The docker backend gives the sandbox its own fake home (/home/node); bwrap
+# has no image to define that in, so it mounts everything at its real host
+# path instead. This one variable is what lets the config/scratch/linker/
+# findings mounts below be written ONCE and shared by both backends.
+if [ "$BACKEND" = docker ]; then HOME_IN="/home/node"; else HOME_IN="$HOME"; fi
+
+# Same story for wrapper binaries (linker/findings/git-hooks): docker's image
+# has a real, writable /usr/local/bin; bwrap's /usr is a read-only bind of the
+# actual host /usr, so a NEW file can't be created under it (the underlying
+# directory is root-owned - a "rw" bind doesn't change real DAC permissions).
+# /opt is never bound from the host at all in either backend, so bwrap can
+# freely create a fresh tree there instead.
+if [ "$BACKEND" = docker ]; then BIN_IN="/usr/local/bin"; else BIN_IN="/opt/csandbox-tools/bin"; fi
+
+PROXY_PORT="${CSANDBOX_PROXY_PORT:-8888}"
+CONFIG_DIR="$HOME/.claude-sandbox"
+mkdir -p "$CONFIG_DIR"
+
 # teardown shortcut
 if [ "${CSANDBOX_DOWN:-}" = "1" ]; then
-  compose down
+  if [ "$BACKEND" = docker ]; then
+    compose down
+  else
+    pidfile="$CONFIG_DIR/bwrap-proxy.pid"
+    if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+      kill "$(cat "$pidfile")" 2>/dev/null || true
+      echo "csandbox: stopped the bwrap-mode egress proxy (pid $(cat "$pidfile"))"
+    else
+      echo "csandbox: no bwrap-mode egress proxy running"
+    fi
+    rm -f "$pidfile" "$CONFIG_DIR/bwrap-proxy.domains"
+  fi
   exit 0
 fi
+
+# --- bwrap backend preflight -------------------------------------------------
+# Fails fast, before any of the setup work below, if the one-time root step
+# (bwrap-setup) hasn't been run - never invoked automatically from here.
+bwrap_preflight() {
+  [ "$(uname -s)" = "Linux" ] || { echo "csandbox: CSANDBOX_BACKEND=bwrap only works on Linux" >&2; exit 1; }
+  command -v bwrap >/dev/null 2>&1 || { echo "csandbox: bwrap (bubblewrap) not installed - apt install bubblewrap" >&2; exit 1; }
+  command -v systemd-run >/dev/null 2>&1 || { echo "csandbox: systemd-run not found - the bwrap backend needs a systemd user session" >&2; exit 1; }
+  if [ ! -f /etc/apparmor.d/bwrap-csandbox ]; then
+    echo "csandbox: one-time setup not done yet - run: sudo $SANDBOX_DIR/bwrap-setup" >&2
+    exit 1
+  fi
+}
+[ "$BACKEND" = bwrap ] && bwrap_preflight
+
+# --- backend-neutral mount list ---------------------------------------------
+# Every mount csandbox wants - workspace, config, scratch, linker/findings,
+# secret shadows, git-hooks - is recorded here once and translated per-
+# backend at launch time (`-v src:dst[:ro]` for docker, `--ro-bind`/`--bind`
+# for bwrap), so that wiring isn't duplicated between the two launch paths.
+MOUNT_MODE=(); MOUNT_SRC=(); MOUNT_DST=()
+add_mount() { MOUNT_MODE+=("$1"); MOUNT_SRC+=("$2"); MOUNT_DST+=("$3"); }  # add_mount <ro|rw> <src> <dst>
 
 # pull csandbox's own flags out of the arg list; everything else goes to claude
 LIVE=0
@@ -104,11 +173,17 @@ while [ $# -gt 0 ]; do
 done
 set -- "${ARGS[@]+"${ARGS[@]}"}"
 
-# --open-egress: layer in the override that also attaches the sandbox to the
-# `egress` bridge, giving it a DIRECT route to the internet (all TCP + UDP) for
-# workloads the HTTP-only proxy can't serve (e.g. UDP P2P / holepunch). This is a
-# deliberate loosening of the isolation for the session; the launch banner warns.
-[ "$OPEN_EGRESS" = 1 ] && COMPOSE_FILE_ARGS+=(-f "$SANDBOX_DIR/docker-compose.open-egress.yml")
+if [ "$OPEN_EGRESS" = 1 ]; then
+  if [ "$BACKEND" = bwrap ]; then
+    echo "error: --open-egress isn't supported yet under CSANDBOX_BACKEND=bwrap" >&2
+    exit 1
+  fi
+  # --open-egress: layer in the override that also attaches the sandbox to the
+  # `egress` bridge, giving it a DIRECT route to the internet (all TCP + UDP) for
+  # workloads the HTTP-only proxy can't serve (e.g. UDP P2P / holepunch). This is a
+  # deliberate loosening of the isolation for the session; the launch banner warns.
+  COMPOSE_FILE_ARGS+=(-f "$SANDBOX_DIR/docker-compose.open-egress.yml")
+fi
 
 # first arg is the project dir if it's a directory, otherwise default to cwd
 if [ $# -gt 0 ] && [ -d "$1" ]; then
@@ -159,22 +234,31 @@ if [ -z "$SESSION_ID" ] && [ "$_has_session_flag" = 0 ] && [ "${CSANDBOX_SHELL:-
   MINT_SESSION_ARGS=(--session-id "$SESSION_ID")
 fi
 
-CONFIG_DIR="$HOME/.claude-sandbox"
-mkdir -p "$CONFIG_DIR"
-
 # tasks db: host-side, and OUTSIDE the bind-mounted config dir so the sandboxed
 # agent can't see or mutate it. csandbox records one row per run here on exit;
 # the review UI reads it. Override the path with CSANDBOX_TASKS_DB.
 TASKS_DB="${CSANDBOX_TASKS_DB:-$HOME/.local/share/csandbox/tasks.db}"
 mkdir -p "$(dirname "$TASKS_DB")"
 
-# Persistent scratch space for the agent, mounted at /home/node/scratch.
-# Writes under a .claude/ dir always trigger Claude Code's hardcoded
-# self-config guard (even with skip-permissions + Bash(*)), so agents get a
-# dedicated dir outside that namespace - pointed at it via the global
-# CLAUDE.md seeded below.
+# Persistent scratch space for the agent. Writes under a .claude/ dir always
+# trigger Claude Code's hardcoded self-config guard (even with skip-
+# permissions + Bash(*)), so agents get a dedicated dir outside that
+# namespace - pointed at it via the global CLAUDE.md seeded below and the
+# $CSANDBOX_SCRATCH env var.
 SCRATCH_DIR="$CONFIG_DIR/scratch"
 mkdir -p "$SCRATCH_DIR"
+# docker renames these to a fixed container-side path (its image's HOME is
+# /home/node, not the real host $CONFIG_DIR/$SCRATCH_DIR names); bwrap mounts
+# everything at its own real host path instead, so it just reuses them as-is.
+if [ "$BACKEND" = docker ]; then
+  SCRATCH_IN="/home/node/scratch"
+  CONFIG_IN="/home/node/.claude"
+else
+  SCRATCH_IN="$SCRATCH_DIR"
+  CONFIG_IN="$CONFIG_DIR"
+fi
+add_mount rw "$CONFIG_DIR" "$CONFIG_IN"
+add_mount rw "$SCRATCH_DIR" "$SCRATCH_IN"
 
 # Per-session summary artifact (docs/agent-contract.md): the agent writes its
 # review summary to $CSANDBOX_SUMMARY. It lives under scratch - agent-writable,
@@ -187,20 +271,20 @@ CSANDBOX_SNAPSHOT=""
 CSANDBOX_COMMENTS=""
 if [ -n "$SESSION_ID" ]; then
   mkdir -p "$SCRATCH_DIR/sessions/$SESSION_ID"
-  CSANDBOX_SUMMARY="/home/node/scratch/sessions/$SESSION_ID/summary.md"
+  CSANDBOX_SUMMARY="$SCRATCH_IN/sessions/$SESSION_ID/summary.md"
   # every worktree created this session (top-level or subagent) is appended here
   # by the post-checkout hook; csandbox ingests it on exit to register sessions
   # (the container can't write the tasks db, which lives outside the mount).
-  CSANDBOX_MANIFEST="/home/node/scratch/sessions/$SESSION_ID/worktrees.jsonl"
+  CSANDBOX_MANIFEST="$SCRATCH_IN/sessions/$SESSION_ID/worktrees.jsonl"
   # Freeze every repo state under ROOT at spawn (branch + sha). Agents work off
   # this snapshot so concurrent host-side checkouts/commits can't disturb a
   # running session; csbox-enter-repo worktrees a repo pinned to its snapshot,
   # and subagents inherit it via the env var. ~150ms over ~/hyper (parallel).
-  CSANDBOX_SNAPSHOT="/home/node/scratch/sessions/$SESSION_ID/snapshot.json"
+  CSANDBOX_SNAPSHOT="$SCRATCH_IN/sessions/$SESSION_ID/snapshot.json"
   # append-only review-comment log (docs/review-loop.md): reviewers (human via
   # csreview, or an agent via the review skill) append comment/resolved/compiled
   # events; one log per session, keyed {repo,branch}. Inherited by subagents.
-  CSANDBOX_COMMENTS="/home/node/scratch/sessions/$SESSION_ID/comments.jsonl"
+  CSANDBOX_COMMENTS="$SCRATCH_IN/sessions/$SESSION_ID/comments.jsonl"
   python3 - "$ROOT" "$SCRATCH_DIR/sessions/$SESSION_ID/snapshot.json" <<'PY' 2>/dev/null || true
 import glob, json, os, subprocess, sys
 from concurrent.futures import ThreadPoolExecutor
@@ -246,13 +330,14 @@ if [ "$FINDINGS" = 1 ]; then
   [ -z "$FINDINGS_DIR" ] && [ "$FINDINGS_EXPLICIT" = 1 ] && echo "csandbox: --findings set but the findings tool wasn't found (npm link it, or set CSANDBOX_FINDINGS_DIR)" >&2
 fi
 
-if [ ! -f "$CONFIG_DIR/CLAUDE.md" ] || ! grep -q '/home/node/scratch' "$CONFIG_DIR/CLAUDE.md"; then
+if [ ! -f "$CONFIG_DIR/CLAUDE.md" ] || ! grep -q '^# Scratch directory$' "$CONFIG_DIR/CLAUDE.md"; then
   cat >> "$CONFIG_DIR/CLAUDE.md" <<'EOF'
 
 # Scratch directory
-Use `/home/node/scratch/` for your own working files (notes, plans, temp
-scripts, intermediate results). Do NOT create or write into `.claude/`
-directories inside projects - writes there trigger approval prompts.
+Use the directory named in the `$CSANDBOX_SCRATCH` environment variable (run
+`echo "$CSANDBOX_SCRATCH"` to get the path) for your own working files (notes,
+plans, temp scripts, intermediate results). Do NOT create or write into
+`.claude/` directories inside projects - writes there trigger approval prompts.
 EOF
 fi
 if ! grep -q 'Top-level session worktree' "$CONFIG_DIR/CLAUDE.md" 2>/dev/null; then
@@ -276,13 +361,13 @@ if ! grep -q 'Parallel worktree subagents' "$CONFIG_DIR/CLAUDE.md" 2>/dev/null; 
 
 # Parallel worktree subagents
 When a task parallelizes, fan out with `Agent(isolation: "worktree")` - each
-subagent gets its own worktree, all in this one container. This nests fine
+subagent gets its own worktree, all in this one sandbox. This nests fine
 under the top-level session's own worktree. node_modules is hydrated
 automatically when the worktree is created, so don't run `npm install` or
 treat the worktree as having no deps. Keep the parallel phase network-quiet:
 adding a NEW dependency needs the npm registry and will trip the egress gate, so
-do dependency changes before/after fanning out, not during. Use /home/node/scratch
-for handoffs between agents.
+do dependency changes before/after fanning out, not during. Use the directory
+named in `$CSANDBOX_SCRATCH` for handoffs between agents.
 EOF
 fi
 if ! grep -q 'Session output' "$CONFIG_DIR/CLAUDE.md" 2>/dev/null; then
@@ -372,15 +457,15 @@ EOF
 # (Read/Grep/Glob) never prompt; outward-publishing tools (Artifact,
 # ShareOnboardingGuide) are left to prompt on purpose, and egress is governed
 # by the proxy regardless.
-# This is safe because the Docker layer - not the permission engine - is the
-# real boundary (non-root, no docker socket, network allowlisted, secrets
-# shadowed). Residual prompts we CANNOT remove without true bypass mode:
+# This is safe because the sandbox layer - not the permission engine - is the
+# real boundary (non-root, network allowlisted, secrets shadowed). Residual
+# prompts we CANNOT remove without true bypass mode:
 #   - writes under protected dirs (.claude, .git, .vscode, ...) - hence the
 #     scratch dir + CLAUDE.md steering the agent away from them
 #   - rm -rf / and rm -rf ~ circuit breakers
-python3 - "$CONFIG_DIR/settings.json" "$ROOT" <<'EOF'
+python3 - "$CONFIG_DIR/settings.json" "$ROOT" "$SCRATCH_IN" <<'EOF'
 import json, sys
-path, root = sys.argv[1], sys.argv[2]
+path, root, scratch_in = sys.argv[1], sys.argv[2], sys.argv[3]
 try:
     with open(path) as f:
         d = json.load(f)
@@ -397,12 +482,12 @@ for rule in ('Bash(*)', 'Edit', 'Write', 'WebFetch', 'WebSearch',
 # file inside the mount but outside the project dir would trigger the
 # "outside working directory" trust prompt. Grant the whole mount root as an
 # additional directory (file access only - no config side-loading, unlike
-# --add-dir). Set to [root] + the scratch mount each launch. Scratch
-# (/home/node/scratch) is a SEPARATE mount outside root where agents keep working
-# copies (CLAUDE.md points them there, away from the protected .claude namespace),
-# so it must be trusted too — otherwise every read/write under scratch triggers
-# the trust prompt once bypass mode is unavailable (the org-policy case above).
-perms['additionalDirectories'] = [root, '/home/node/scratch']
+# --add-dir). Set to [root] + the scratch mount each launch. Scratch is a
+# SEPARATE mount outside root where agents keep working copies (CLAUDE.md
+# points them there, away from the protected .claude namespace), so it must
+# be trusted too - otherwise every read/write under scratch triggers the
+# trust prompt once bypass mode is unavailable (the org-policy case above).
+perms['additionalDirectories'] = [root, scratch_in]
 # EnterWorktree (called at session start per the "Top-level session worktree"
 # CLAUDE.md guidance) branches from the current commit rather than the default
 # branch. setdefault so this is only a seeded default - a user customization is
@@ -413,9 +498,8 @@ with open(path, 'w') as f:
 EOF
 
 # git identity for commits made inside the sandbox
-EXTRA_MOUNTS=()
 if [ -f "$HOME/.gitconfig" ]; then
-  EXTRA_MOUNTS+=(-v "$HOME/.gitconfig:/home/node/.gitconfig:ro")
+  add_mount ro "$HOME/.gitconfig" "$HOME_IN/.gitconfig"
 fi
 
 # --- linker: declarative local-dev linking ------------------------------
@@ -429,9 +513,10 @@ if [ -n "$LINKER_DIR" ]; then
   LINKER_WRAPPER="$(dirname "$TASKS_DB")/linker-wrapper"
   printf '#!/bin/sh\nexec node /opt/linker/cli.js "$@"\n' > "$LINKER_WRAPPER"
   chmod +x "$LINKER_WRAPPER"
-  EXTRA_MOUNTS+=(-v "$LINKER_DIR:/opt/linker:ro" -v "$LINKER_WRAPPER:/usr/local/bin/linker:ro")
+  add_mount ro "$LINKER_DIR" /opt/linker
+  add_mount ro "$LINKER_WRAPPER" "$BIN_IN/linker"
   [ -f "$HOME/.linker/registry.json" ] \
-    && EXTRA_MOUNTS+=(-v "$HOME/.linker/registry.json:/home/node/.linker/registry.json:ro")
+    && add_mount ro "$HOME/.linker/registry.json" "$HOME_IN/.linker/registry.json"
 fi
 
 # --- findings: external queryable memory (on by default; --no-findings) -----
@@ -445,15 +530,16 @@ if [ -n "$FINDINGS_DIR" ]; then
   printf '#!/bin/sh\nexec node /opt/findings/cli.js "$@"\n' > "$FINDINGS_WRAPPER"
   chmod +x "$FINDINGS_WRAPPER"
   mkdir -p "$HOME/.findings"
-  EXTRA_MOUNTS+=(-v "$FINDINGS_DIR:/opt/findings:ro" -v "$FINDINGS_WRAPPER:/usr/local/bin/findings:ro")
-  EXTRA_MOUNTS+=(-v "$HOME/.findings:/home/node/.findings")   # rw: shared store + telemetry trace
-  FINDINGS_EVENTS="/home/node/.findings/events.jsonl"
+  add_mount ro "$FINDINGS_DIR" /opt/findings
+  add_mount ro "$FINDINGS_WRAPPER" "$BIN_IN/findings"
+  add_mount rw "$HOME/.findings" "$HOME_IN/.findings"   # rw: shared store + telemetry trace
+  FINDINGS_EVENTS="$HOME_IN/.findings/events.jsonl"
 fi
 
 # --- secret scrubbing -------------------------------------------------
 # Shadow known secret-shaped files under the mounted root with an empty
-# read-only file inside the container. The host files are never touched -
-# this only affects what the container sees.
+# read-only file inside the sandbox. The host files are never touched -
+# this only affects what the sandbox sees.
 SECRET_PATTERNS=(
   '.env' '.env.*' '*.pem' '*.key' '*.p12' '*.pfx' '*.keystore'
   'id_rsa' 'id_rsa.*' 'id_ed25519' 'id_ed25519.*' 'id_ecdsa' 'id_ecdsa.*'
@@ -468,7 +554,7 @@ done
 
 SCRUB_COUNT=0
 while IFS= read -r -d '' f; do
-  EXTRA_MOUNTS+=(-v "/dev/null:$f:ro")
+  add_mount ro /dev/null "$f"
   SCRUB_COUNT=$((SCRUB_COUNT + 1))
 done < <(find "$ROOT" \
   \( -path '*/node_modules/*' -o -path '*/.git/*' \) -prune -o \
@@ -514,11 +600,12 @@ ALLOWED_DOMAINS="$(printf '%s\n' "${DOMAIN_SET[@]}" | awk '!seen[$0]++' | paste 
 export ALLOWED_DOMAINS
 
 # --- workspace mount mode ------------------------------------------------
-WORKSPACE_MOUNT="$ROOT:$ROOT"
 MOUNT_NOTE="read-write"
 if [ "${CSANDBOX_READONLY:-}" = "1" ]; then
-  WORKSPACE_MOUNT="$ROOT:$ROOT:ro"
+  add_mount ro "$ROOT" "$ROOT"
   MOUNT_NOTE="read-only"
+else
+  add_mount rw "$ROOT" "$ROOT"
 fi
 
 if [ "${CSANDBOX_SHELL:-}" = "1" ]; then
@@ -528,10 +615,11 @@ else
   # "Top-level session worktree" block in the seeded CLAUDE.md). --live overrides
   # that with a system-prompt directive, so the agent edits the checked-out tree
   # directly - use it when you want its work to land on your working tree.
-  CLAUDE_ENV=(IS_SANDBOX=1)
+  CLAUDE_ENV=(IS_SANDBOX=1 "DISABLE_AUTOUPDATER=1")
   [ -n "$CSANDBOX_SUMMARY" ] && CLAUDE_ENV+=("CSANDBOX_SUMMARY=$CSANDBOX_SUMMARY")
   [ -n "$CSANDBOX_MANIFEST" ] && CLAUDE_ENV+=("CSANDBOX_MANIFEST=$CSANDBOX_MANIFEST")
   [ -n "$CSANDBOX_COMMENTS" ] && CLAUDE_ENV+=("CSANDBOX_COMMENTS=$CSANDBOX_COMMENTS")
+  CLAUDE_ENV+=("CSANDBOX_SCRATCH=$SCRATCH_IN")
   # CSANDBOX_SESSION_ID + CSANDBOX_SNAPSHOT are inherited by subagents, so they
   # share this session's frozen snapshot and per-repo worktrees.
   [ -n "$CSANDBOX_SNAPSHOT" ] && CLAUDE_ENV+=("CSANDBOX_SNAPSHOT=$CSANDBOX_SNAPSHOT" "CSANDBOX_SESSION_ID=$SESSION_ID")
@@ -542,43 +630,152 @@ else
     CLAUDE_ARGS+=(--append-system-prompt "This session was launched with csandbox --live: work DIRECTLY in the checked-out working tree on its CURRENT branch, for the whole session. Do NOT create or switch to another branch or git worktree by ANY means - not EnterWorktree, not csbox-enter-repo, and not raw git (git worktree add / git checkout -b / git switch -c) - not at startup, not mid-session, and not to package a deliverable, review, or fix. If you commit, commit on the current branch. The user has deliberately chosen to work live on their current tree; this OVERRIDES all branch/worktree guidance in CLAUDE.md (the Top-level session worktree block, Crossing repos, and any review guidance).")
   fi
   if [ -n "$FINDINGS_DIR" ]; then
-    CLAUDE_ENV+=("FINDINGS_DB=/home/node/.findings/findings.db" "FINDINGS_EVENTS=$FINDINGS_EVENTS")
+    CLAUDE_ENV+=("FINDINGS_DB=$HOME_IN/.findings/findings.db" "FINDINGS_EVENTS=$FINDINGS_EVENTS")
     [ -n "$SESSION_ID" ] && CLAUDE_ENV+=("FINDINGS_SESSION=$SESSION_ID")
     # ephemeral (per-run) guidance - NOT written to the persistent CLAUDE.md, so
     # it never leaks into non --findings runs. Same mechanism as --live above.
     CLAUDE_ARGS+=(--append-system-prompt "An external 'findings' memory (a shared cross-session store) is available this session. Before investigating anything non-trivial, run 'findings recall <terms>' first - a past session may have already worked it out. When you learn something durable that isn't obvious from the code (a mechanism or gotcha, a decision and why, or a fact about the user/environment), record it with 'findings record'. Full usage guide: /opt/findings/skills/findings.md. This is opt-in test tooling - use it alongside your normal workflow.")
   fi
+  if [ "$BACKEND" = bwrap ]; then
+    CLAUDE_ENV+=("HTTP_PROXY=http://127.0.0.1:$PROXY_PORT" "HTTPS_PROXY=http://127.0.0.1:$PROXY_PORT" "NO_PROXY=localhost,127.0.0.1")
+  fi
   CMD=(env "${CLAUDE_ENV[@]}" claude "${CLAUDE_ARGS[@]}" "$@")
 fi
 
 # --- launch -------------------------------------------------------------
-echo "csandbox: mount $ROOT ($MOUNT_NOTE), $SCRUB_COUNT secret file(s) shadowed"
+echo "csandbox: backend=$BACKEND, mount $ROOT ($MOUNT_NOTE), $SCRUB_COUNT secret file(s) shadowed"
 echo "csandbox: egress allowlist -> $ALLOWED_DOMAINS"
 [ -n "$LINKER_DIR" ] && echo "csandbox: linker -> $LINKER_DIR (declarative local links wired per-worktree)"
 [ -n "$FINDINGS_DIR" ] && echo "csandbox: findings -> $FINDINGS_DIR (external memory at ~/.findings, telemetry on; --no-findings to disable)"
 [ "$OPEN_EGRESS" = 1 ] && echo "csandbox: --open-egress -> DIRECT unfiltered egress this session (all TCP+UDP); the proxy allowlist is NOT a hard boundary (well-behaved HTTP still prefers the proxy)"
 [ "$LIVE" = 1 ] && echo "csandbox: --live -> agent edits the working tree directly (no top-level worktree)"
 
-# dry run: show resolved config and stop before touching docker
+# dry run: show resolved config and stop before touching docker/bwrap
 if [ "${CSANDBOX_DRYRUN:-}" = "1" ]; then
   echo "csandbox: workdir $PROJECT_DIR"
-  for m in "${EXTRA_MOUNTS[@]}"; do [ "$m" = "-v" ] || echo "csandbox: extra mount $m"; done
+  for i in "${!MOUNT_SRC[@]}"; do
+    echo "csandbox: mount (${MOUNT_MODE[$i]}) ${MOUNT_SRC[$i]} -> ${MOUNT_DST[$i]}"
+  done
   echo "csandbox: (dry run, not launching)"
   exit 0
 fi
 
-# build images quietly (only rebuilds on change; fast when cached)
-compose build --quiet 2>/dev/null || compose build
+RC=0
+BLOCKED=""
 
-# (re)create the proxy with the current allowlist (compose recreates it when
-# ALLOWED_DOMAINS differs from the running instance)
-compose up -d proxy >/dev/null 2>&1
-SINCE="$(date -u +%Y-%m-%dT%H:%M:%S)"
+launch_docker() {
+  # build images quietly (only rebuilds on change; fast when cached)
+  compose build --quiet 2>/dev/null || compose build
 
-# Mark the session RUNNING in the tasks db up front (host-side; the container
+  # (re)create the proxy with the current allowlist (compose recreates it when
+  # ALLOWED_DOMAINS differs from the running instance)
+  compose up -d proxy >/dev/null 2>&1
+  local since; since="$(date -u +%Y-%m-%dT%H:%M:%S)"
+
+  local docker_mounts=()
+  local i
+  for i in "${!MOUNT_SRC[@]}"; do
+    if [ "${MOUNT_MODE[$i]}" = ro ]; then
+      docker_mounts+=(-v "${MOUNT_SRC[$i]}:${MOUNT_DST[$i]}:ro")
+    else
+      docker_mounts+=(-v "${MOUNT_SRC[$i]}:${MOUNT_DST[$i]}")
+    fi
+  done
+
+  set +e
+  compose run --rm "${docker_mounts[@]}" -w "$PROJECT_DIR" sandbox "${CMD[@]}"
+  RC=$?
+  set -e
+
+  # report any hosts blocked during this session so the user knows what to add
+  BLOCKED="$(compose logs proxy --since "$since" 2>/dev/null \
+    | grep -oE 'DENY [^:]+:' | sed 's/DENY //; s/:$//' | sort -u | paste -sd, - || true)"
+}
+
+launch_bwrap() {
+  # host-side proxy lifecycle: reuse a running instance unless the resolved
+  # allowlist changed, mirroring `compose up -d proxy`'s recreate-on-change.
+  local pidfile="$CONFIG_DIR/bwrap-proxy.pid"
+  local domainsfile="$CONFIG_DIR/bwrap-proxy.domains"
+  local logfile="$CONFIG_DIR/bwrap-proxy.log"
+  local running=0
+  if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; then running=1; fi
+  if [ "$running" = 1 ] && [ "$(cat "$domainsfile" 2>/dev/null || true)" = "$ALLOWED_DOMAINS" ]; then
+    : # reuse the already-running proxy
+  else
+    if [ "$running" = 1 ]; then kill "$(cat "$pidfile")" 2>/dev/null || true; fi
+    (ALLOWED_DOMAINS="$ALLOWED_DOMAINS" PROXY_PORT="$PROXY_PORT" \
+      setsid node "$SANDBOX_DIR/egress-proxy/proxy.js" >>"$logfile" 2>&1 &
+      echo $! > "$pidfile")
+    echo "$ALLOWED_DOMAINS" > "$domainsfile"
+    sleep 0.3   # let it bind before the sandboxed process starts dialing out
+  fi
+  local proxy_log_start; proxy_log_start="$(wc -l < "$logfile" 2>/dev/null || echo 0)"
+
+  # base system view: the real host toolchain, read-only; nothing else from
+  # $HOME except the explicit mounts below (workspace/config/scratch/extras)
+  local bw=(--unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup --disable-userns --die-with-parent
+            --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind-try /lib /lib
+            --ro-bind-try /lib64 /lib64 --ro-bind-try /sbin /sbin
+            --ro-bind /etc /etc --proc /proc --dev /dev --tmpfs /tmp)
+
+  # node/npm + the claude CLI live under $HOME (nvm / ~/.local), not /usr -
+  # bind just those, read-only (mount-not-bake, same spirit as linker/findings
+  # above). This is what lets the bwrap path skip a build step entirely.
+  local node_bin_dir; node_bin_dir="$(dirname "$(resolve "$(command -v node)")")"
+  bw+=(--ro-bind "$node_bin_dir" "$node_bin_dir")
+  bw+=(--ro-bind-try "$HOME/.local/bin" "$HOME/.local/bin")
+  bw+=(--ro-bind-try "$HOME/.local/share/claude" "$HOME/.local/share/claude")
+
+  # git-hooks: mirrors the Dockerfile's `git config --system core.hooksPath`,
+  # but via GIT_CONFIG_SYSTEM (git 2.32+) instead of writing into /etc -
+  # /etc is bound straight from the real host read-only, and it's root-owned
+  # there, so even a "rw" bind can't create a new /etc/gitconfig on top of it
+  # (bind mount options don't override the underlying directory's real DAC
+  # permissions). Pointing git at our own file entirely sidesteps that.
+  local gitconfig="$CONFIG_DIR/bwrap-etc-gitconfig"
+  printf '[core]\n\thooksPath = /opt/csandbox-tools/share/git-hooks\n' > "$gitconfig"
+  bw+=(--setenv GIT_CONFIG_SYSTEM "$gitconfig")
+  bw+=(--ro-bind "$SANDBOX_DIR/git-hooks" /opt/csandbox-tools/share/git-hooks)
+  bw+=(--ro-bind "$SANDBOX_DIR/git-hooks/wt-hydrate" "$BIN_IN/wt-hydrate")
+  bw+=(--ro-bind "$SANDBOX_DIR/git-hooks/csbox-enter-repo" "$BIN_IN/csbox-enter-repo")
+
+  # everything else: workspace/config/scratch/linker/findings/secret-shadows
+  local i
+  for i in "${!MOUNT_SRC[@]}"; do
+    if [ "${MOUNT_MODE[$i]}" = ro ]; then
+      bw+=(--ro-bind "${MOUNT_SRC[$i]}" "${MOUNT_DST[$i]}")
+    else
+      bw+=(--bind "${MOUNT_SRC[$i]}" "${MOUNT_DST[$i]}")
+    fi
+  done
+
+  bw+=(--chdir "$PROJECT_DIR")
+  bw+=(--setenv PATH "$node_bin_dir:$HOME/.local/bin:$BIN_IN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+  bw+=(--setenv HOME "$HOME")
+  bw+=(--setenv CLAUDE_CONFIG_DIR "$CONFIG_IN")
+
+  # Each run gets its own systemd --user transient scope under a fixed
+  # "csandbox" slice; that slice is what the one-time nft rule (bwrap-setup)
+  # restricts to the proxy's loopback port. No root/veth/slirp4netns needed -
+  # the sandboxed process stays in the host's real network namespace, but
+  # can't reach anything the nft rule doesn't allow.
+  set +e
+  systemd-run --user --scope --quiet --slice=csandbox \
+    -p MemoryMax=16G -p TasksMax=8192 \
+    --unit "csandbox-${SESSION_ID:-run}-$$" \
+    -- bwrap "${bw[@]}" -- "${CMD[@]}"
+  RC=$?
+  set -e
+
+  BLOCKED="$(tail -n "+$((proxy_log_start + 1))" "$logfile" 2>/dev/null \
+    | grep -oE 'DENY [^:]+:' | sed 's/DENY //; s/:$//' | sort -u | paste -sd, - || true)"
+}
+
+# Mark the session RUNNING in the tasks db up front (host-side; the sandbox
 # can't reach the db). The review app uses this to show live sessions and to
 # refuse a merge/destroy on one. The post-run recorder flips it to ready/
-# summary_only on exit; a row stuck at 'running' means the container was killed
+# summary_only on exit; a row stuck at 'running' means the sandbox was killed
 # hard. Skipped for shell mode and picker runs (no id yet).
 if [ -n "$SESSION_ID" ] && [ "${CSANDBOX_SHELL:-}" != "1" ]; then
   python3 - "$TASKS_DB" "$SESSION_ID" "$PROJECT_DIR" "$NAME" "$SCRATCH_DIR" <<'PY' 2>/dev/null || true
@@ -611,28 +808,19 @@ finally:
 PY
 fi
 
-set +e
-compose run --rm \
-  -v "$WORKSPACE_MOUNT" \
-  -v "$CONFIG_DIR:/home/node/.claude" \
-  -v "$SCRATCH_DIR:/home/node/scratch" \
-  "${EXTRA_MOUNTS[@]}" \
-  -w "$PROJECT_DIR" \
-  sandbox \
-  "${CMD[@]}"
-RC=$?
-set -e
+if [ "$BACKEND" = docker ]; then
+  launch_docker
+else
+  launch_bwrap
+fi
 
-# report any hosts blocked during this session so the user knows what to add
-BLOCKED="$(compose logs proxy --since "$SINCE" 2>/dev/null \
-  | grep -oE 'DENY [^:]+:' | sed 's/DENY //; s/:$//' | sort -u | paste -sd, - || true)"
 if [ -n "$BLOCKED" ]; then
   echo "csandbox: blocked egress this session -> $BLOCKED"
   echo "csandbox: to allow, re-run with CSANDBOX_EXTRA_DOMAINS=$BLOCKED (or a profile)"
 fi
 
 # --- record this run in the tasks db (host-side) -------------------------
-# One row per run for the review UI. Written on the host, not in the container,
+# One row per run for the review UI. Written on the host, not in the sandbox,
 # so concurrent sandboxes are just ordinary multi-process SQLite on a local fs
 # (busy_timeout absorbs the rare collision). Best-effort: never fail the launch
 # over recording. The session's working dir is read from the session file's
