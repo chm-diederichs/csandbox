@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# PostToolUse hook (matcher: Edit|Write). Nudges the agent to also record
+# memory-worthy content into findings-memory when it writes a Claude Code
+# per-project auto-memory TOPIC file - skips MEMORY.md itself (just an index,
+# not new content) and every other Write/Edit.
+#
+# PostToolUse can't block (the tool already ran by the time this fires) and
+# does NOT support hookSpecificOutput.additionalContext (that's
+# UserPromptSubmit's mechanism, not this event's - verified against
+# code.claude.com/docs/en/hooks.md, not assumed). The only way this event can
+# surface anything to the agent is: exit 2 -> stderr is shown to Claude as
+# context on the already-completed call. Exit 0 -> stderr goes to the debug
+# log only, invisible to the agent. So exit 2 here is not a failure signal,
+# it's the delivery mechanism.
+set -euo pipefail
+
+file_path="$(python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("")
+else:
+    print(d.get("tool_input", {}).get("file_path", ""))
+')"
+
+case "$file_path" in
+  */memory/MEMORY.md) exit 0 ;;
+  */memory/*.md)
+    cat >&2 <<'NUDGE'
+You just wrote a per-project auto-memory entry. This session also has a
+cross-repo "findings" store - if it's worth surfacing outside this one repo,
+also record it with `findings record`:
+  - kind observation - a verifiable fact about how the CODE behaves (anchor
+    with --file <path> --sha <sha>, or omit to auto-fill from HEAD).
+  - kind memory --category process - how to work with the user (preferences,
+    corrections, workflow habits) - not code-specific.
+  - kind memory --category project - context specific to this repo (ongoing
+    work, decisions, environment facts) that isn't itself a code claim.
+Skip this if what you just wrote is genuinely local and not worth surfacing
+elsewhere.
+NUDGE
+    exit 2
+    ;;
+  *) exit 0 ;;
+esac

@@ -547,6 +547,7 @@ fi
 # and the telemetry trace). FINDINGS_EVENTS logs a recall/record trace so miss-rate
 # is measurable. Active whenever the tool was detected; --no-findings opts out.
 FINDINGS_EVENTS=""
+MEMORY_NUDGE_IN=""
 if [ -n "$FINDINGS_DIR" ]; then
   FINDINGS_WRAPPER="$(dirname "$TASKS_DB")/findings-wrapper"
   printf '#!/bin/sh\nexec node /opt/findings/cli.js "$@"\n' > "$FINDINGS_WRAPPER"
@@ -556,6 +557,35 @@ if [ -n "$FINDINGS_DIR" ]; then
   add_mount ro "$FINDINGS_WRAPPER" "$BIN_IN/findings"
   add_mount rw "$HOME/.findings" "$HOME_IN/.findings"   # rw: shared store + telemetry trace
   FINDINGS_EVENTS="$HOME_IN/.findings/events.jsonl"
+  # PostToolUse hook: nudges the agent to also findings-record its own auto
+  # memory writes, since that's a nudge Claude Code itself never gives it
+  # (the two systems don't know about each other). Only wired up when
+  # findings is actually available - the nudge tells the agent to run
+  # `findings record`, which would just fail otherwise.
+  MEMORY_NUDGE_SCRIPT="$(dirname "$TASKS_DB")/memory-findings-nudge"
+  cp "$(dirname "$0")/claude-hooks/memory-findings-nudge" "$MEMORY_NUDGE_SCRIPT"
+  chmod +x "$MEMORY_NUDGE_SCRIPT"
+  MEMORY_NUDGE_IN="$BIN_IN/memory-findings-nudge"
+  add_mount ro "$MEMORY_NUDGE_SCRIPT" "$MEMORY_NUDGE_IN"
+  # Register the PostToolUse hook in settings.json. Idempotent by command
+  # path, since this patch runs on every launch and settings.json persists
+  # across them - a plain append would duplicate the entry every session.
+  python3 - "$CONFIG_DIR/settings.json" "$MEMORY_NUDGE_IN" <<'EOF'
+import json, sys
+path, cmd = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    d = json.load(f)
+post = d.setdefault('hooks', {}).setdefault('PostToolUse', [])
+already = any(
+    h.get('matcher') == 'Edit|Write'
+    and any(hh.get('command') == cmd for hh in h.get('hooks', []))
+    for h in post
+)
+if not already:
+    post.append({'matcher': 'Edit|Write', 'hooks': [{'type': 'command', 'command': cmd}]})
+with open(path, 'w') as f:
+    json.dump(d, f, indent=2)
+EOF
 fi
 
 # --- secret scrubbing -------------------------------------------------
