@@ -563,7 +563,7 @@ if [ -n "$FINDINGS_DIR" ]; then
   # findings is actually available - the nudge tells the agent to run
   # `findings record`, which would just fail otherwise.
   MEMORY_NUDGE_SCRIPT="$(dirname "$TASKS_DB")/memory-findings-nudge"
-  cp "$(dirname "$0")/claude-hooks/memory-findings-nudge" "$MEMORY_NUDGE_SCRIPT"
+  cp "$SANDBOX_DIR/claude-hooks/memory-findings-nudge" "$MEMORY_NUDGE_SCRIPT"
   chmod +x "$MEMORY_NUDGE_SCRIPT"
   MEMORY_NUDGE_IN="$BIN_IN/memory-findings-nudge"
   add_mount ro "$MEMORY_NUDGE_SCRIPT" "$MEMORY_NUDGE_IN"
