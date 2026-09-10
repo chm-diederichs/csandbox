@@ -2,10 +2,14 @@
 #
 # csandbox [project-dir] [claude args...]
 #
-# Default launcher for running Claude Code with --dangerously-skip-permissions
-# inside a hardened sandbox: native Linux namespaces (bubblewrap), no daemon,
-# no image, no build step. Linux-only. One-time root setup required first:
-# `sudo ./bwrap-setup` (see that script's header for what it does and why).
+# Default launcher for running Claude Code inside a hardened, image-less, daemon-
+# less sandbox. Two backends, chosen by OS (override with CSANDBOX_BACKEND):
+#   Linux -> bwrap    native namespaces (bubblewrap) + an nft-confined egress
+#                     proxy. One-time root setup first: `sudo ./bwrap-setup`.
+#   macOS -> seatbelt Claude Code's own built-in OS sandbox (Seatbelt) - filesystem
+#                     scoping + a domain-allowlisted egress proxy, no root/setup.
+# The workflow layer (session db, worktrees, linker, findings, CLAUDE.md
+# seeding) and the egress-allowlist model below are shared across both.
 #
 # The sandboxed process stays in the host's normal network namespace, but is
 # launched into a dedicated systemd/cgroup slice that a one-time nft rule
@@ -58,8 +62,31 @@
 
 set -euo pipefail
 
-resolve() { readlink -f "$1"; }
-gen_uuid() { cat /proc/sys/kernel/random/uuid; }
+# macOS ships bash 3.2 (frozen for GPLv3 reasons), where empty-array expansion
+# under `set -u` errors; we target bash >= 4. Fail fast with the fix rather than
+# crashing mid-run on an "unbound variable".
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+  echo "csandbox: needs bash >= 4 (macOS ships 3.2 - run 'brew install bash')" >&2
+  exit 1
+fi
+
+# Portable across Linux + macOS: macOS lacks `readlink -f` (older releases) and
+# /proc, so avoid both. Follow a symlink chain by hand and mint uuids from
+# whatever is available.
+resolve() {
+  local p="$1" t
+  while [ -L "$p" ]; do
+    t="$(readlink "$p")"
+    case "$t" in /*) p="$t" ;; *) p="$(cd "$(dirname "$p")" && pwd)/$t" ;; esac
+  done
+  printf '%s\n' "$p"
+}
+gen_uuid() {
+  if [ -r /proc/sys/kernel/random/uuid ]; then cat /proc/sys/kernel/random/uuid
+  elif command -v uuidgen >/dev/null 2>&1; then uuidgen | tr '[:upper:]' '[:lower:]'
+  else python3 -c 'import uuid; print(uuid.uuid4())'
+  fi
+}
 
 SANDBOX_DIR="$(cd "$(dirname "$(resolve "${BASH_SOURCE[0]}")")" && pwd)"
 
@@ -91,11 +118,27 @@ if [ "${CSANDBOX_DOWN:-}" = "1" ]; then
   exit 0
 fi
 
-# --- preflight ---------------------------------------------------------------
-# Fails fast, before any of the setup work below, if the one-time root step
-# (bwrap-setup) hasn't been run - never invoked automatically from here.
+# --- backend selection + preflight -------------------------------------------
+# Two isolation backends, picked by OS (override with CSANDBOX_BACKEND):
+#   bwrap    - Linux native namespaces + an nft-confined egress proxy (default
+#              on Linux; needs the one-time `sudo bwrap-setup`).
+#   seatbelt - macOS, via Claude Code's OWN built-in OS sandbox (Seatbelt): it
+#              provides filesystem scoping AND a domain-allowlisted egress proxy
+#              with no external daemon, no root setup, and no image. See
+#              launch_seatbelt below. The workflow layer (session db, worktrees,
+#              linker, findings, CLAUDE.md seeding) is shared with bwrap.
+BACKEND="${CSANDBOX_BACKEND:-}"
+if [ -z "$BACKEND" ]; then
+  case "$(uname -s)" in
+    Linux)  BACKEND=bwrap ;;
+    Darwin) BACKEND=seatbelt ;;
+    *) echo "csandbox: unsupported OS '$(uname -s)' (need Linux or macOS)" >&2; exit 1 ;;
+  esac
+fi
+
+# Fails fast, before any of the setup work below, if a backend prerequisite is
+# missing - never invoked automatically from here.
 bwrap_preflight() {
-  [ "$(uname -s)" = "Linux" ] || { echo "csandbox: only works on Linux" >&2; exit 1; }
   command -v bwrap >/dev/null 2>&1 || { echo "csandbox: bwrap (bubblewrap) not installed - apt install bubblewrap" >&2; exit 1; }
   command -v systemd-run >/dev/null 2>&1 || { echo "csandbox: systemd-run not found - csandbox needs a systemd user session" >&2; exit 1; }
   if [ ! -f /etc/apparmor.d/bwrap-csandbox ]; then
@@ -103,7 +146,15 @@ bwrap_preflight() {
     exit 1
   fi
 }
-bwrap_preflight
+seatbelt_preflight() {
+  [ "$(uname -s)" = "Darwin" ] || { echo "csandbox: the seatbelt backend is macOS-only" >&2; exit 1; }
+  command -v claude >/dev/null 2>&1 || { echo "csandbox: 'claude' not found on PATH" >&2; exit 1; }
+}
+case "$BACKEND" in
+  bwrap)    bwrap_preflight ;;
+  seatbelt) seatbelt_preflight ;;
+  *) echo "csandbox: unknown CSANDBOX_BACKEND='$BACKEND' (valid: bwrap seatbelt)" >&2; exit 1 ;;
+esac
 
 # --- mount list ---------------------------------------------------------
 # Every mount csandbox wants - workspace, config, scratch, linker/findings,
@@ -542,12 +593,23 @@ for i in "${!SECRET_PATTERNS[@]}"; do
 done
 
 SCRUB_COUNT=0
+SECRET_FILES=()   # captured for the seatbelt backend's denyRead (no /dev/null bind there)
 while IFS= read -r -d '' f; do
   add_mount ro /dev/null "$f"
+  SECRET_FILES+=("$f")
   SCRUB_COUNT=$((SCRUB_COUNT + 1))
 done < <(find "$ROOT" \
   \( -path '*/node_modules/*' -o -path '*/.git/*' \) -prune -o \
   -type f \( "${FIND_NAME_ARGS[@]}" \) -print0 2>/dev/null)
+
+# Well-known credential locations under $HOME. bwrap never exposes these (it only
+# binds the workspace/config/scratch), but the seatbelt backend leaves the host
+# filesystem visible by default, so they must be denied explicitly there.
+HOME_SECRETS=(
+  "$HOME/.ssh" "$HOME/.aws" "$HOME/.gnupg" "$HOME/.config/gcloud"
+  "$HOME/.config/gh" "$HOME/.npmrc" "$HOME/.netrc" "$HOME/.docker/config.json"
+  "$HOME/.kube/config" "$HOME/.git-credentials" "$HOME/.claude/.credentials.json"
+)
 
 # --- egress allowlist ---------------------------------------------------
 profile_domains() {
@@ -609,6 +671,10 @@ else
   [ -n "$CSANDBOX_MANIFEST" ] && CLAUDE_ENV+=("CSANDBOX_MANIFEST=$CSANDBOX_MANIFEST")
   [ -n "$CSANDBOX_COMMENTS" ] && CLAUDE_ENV+=("CSANDBOX_COMMENTS=$CSANDBOX_COMMENTS")
   CLAUDE_ENV+=("CSANDBOX_SCRATCH=$SCRATCH_IN")
+  # bwrap injects CLAUDE_CONFIG_DIR via --setenv at launch; the seatbelt backend
+  # runs claude with the plain env, so it must be set here or claude reads the
+  # default ~/.claude instead of the sandbox config we populated.
+  [ "$BACKEND" = seatbelt ] && CLAUDE_ENV+=("CLAUDE_CONFIG_DIR=$CONFIG_IN")
   # CSANDBOX_SESSION_ID + CSANDBOX_SNAPSHOT are inherited by subagents, so they
   # share this session's frozen snapshot and per-repo worktrees.
   [ -n "$CSANDBOX_SNAPSHOT" ] && CLAUDE_ENV+=("CSANDBOX_SNAPSHOT=$CSANDBOX_SNAPSHOT" "CSANDBOX_SESSION_ID=$SESSION_ID")
@@ -621,27 +687,41 @@ else
   if [ -n "$FINDINGS_DIR" ]; then
     CLAUDE_ENV+=("FINDINGS_DB=$HOME_IN/.findings/findings.db" "FINDINGS_EVENTS=$FINDINGS_EVENTS")
     [ -n "$SESSION_ID" ] && CLAUDE_ENV+=("FINDINGS_SESSION=$SESSION_ID")
+    # The guide lives at the mounted /opt path under bwrap, but at its real host
+    # path under seatbelt (which doesn't relocate the filesystem).
+    if [ "$BACKEND" = seatbelt ]; then FINDINGS_GUIDE="$FINDINGS_DIR/skills/findings.md"; else FINDINGS_GUIDE="/opt/findings/skills/findings.md"; fi
     # ephemeral (per-run) guidance - NOT written to the persistent CLAUDE.md, so
     # it never leaks into non --findings runs. Same mechanism as --live above.
-    CLAUDE_ARGS+=(--append-system-prompt "An external 'findings' memory (a shared cross-session store) is available this session. Before investigating anything non-trivial, run 'findings recall <terms>' first - a past session may have already worked it out. When you learn something durable that isn't obvious from the code (a mechanism or gotcha, a decision and why, or a fact about the user/environment), record it with 'findings record'. Full usage guide: /opt/findings/skills/findings.md. This is opt-in test tooling - use it alongside your normal workflow.")
+    CLAUDE_ARGS+=(--append-system-prompt "An external 'findings' memory (a shared cross-session store) is available this session. Before investigating anything non-trivial, run 'findings recall <terms>' first - a past session may have already worked it out. When you learn something durable that isn't obvious from the code (a mechanism or gotcha, a decision and why, or a fact about the user/environment), record it with 'findings record'. Full usage guide: $FINDINGS_GUIDE. This is opt-in test tooling - use it alongside your normal workflow.")
   fi
-  CLAUDE_ENV+=("HTTP_PROXY=http://127.0.0.1:$PROXY_PORT" "HTTPS_PROXY=http://127.0.0.1:$PROXY_PORT" "NO_PROXY=localhost,127.0.0.1")
+  # bwrap routes egress through the loopback node proxy (nft-confined); seatbelt
+  # uses Claude Code's built-in sandbox proxy instead, so no HTTP_PROXY here.
+  if [ "$BACKEND" = bwrap ]; then
+    CLAUDE_ENV+=("HTTP_PROXY=http://127.0.0.1:$PROXY_PORT" "HTTPS_PROXY=http://127.0.0.1:$PROXY_PORT" "NO_PROXY=localhost,127.0.0.1")
+  fi
   CMD=(env "${CLAUDE_ENV[@]}" claude "${CLAUDE_ARGS[@]}" "$@")
 fi
 
 # --- launch -------------------------------------------------------------
+echo "csandbox: backend $BACKEND"
 echo "csandbox: mount $ROOT ($MOUNT_NOTE), $SCRUB_COUNT secret file(s) shadowed"
 echo "csandbox: egress allowlist -> $ALLOWED_DOMAINS"
 [ -n "$LINKER_DIR" ] && echo "csandbox: linker -> $LINKER_DIR (declarative local links wired per-worktree)"
 [ -n "$FINDINGS_DIR" ] && echo "csandbox: findings -> $FINDINGS_DIR (external memory at ~/.findings, telemetry on; --no-findings to disable)"
 [ "$LIVE" = 1 ] && echo "csandbox: --live -> agent edits the working tree directly (no top-level worktree)"
 
-# dry run: show resolved config and stop before launching bwrap
+# dry run: show resolved config and stop before launching the backend
 if [ "${CSANDBOX_DRYRUN:-}" = "1" ]; then
   echo "csandbox: workdir $PROJECT_DIR"
-  for i in "${!MOUNT_SRC[@]}"; do
-    echo "csandbox: mount (${MOUNT_MODE[$i]}) ${MOUNT_SRC[$i]} -> ${MOUNT_DST[$i]}"
-  done
+  if [ "$BACKEND" = seatbelt ]; then
+    for f in "${HOME_SECRETS[@]}" ${SECRET_FILES[@]+"${SECRET_FILES[@]}"}; do
+      [ -e "$f" ] && echo "csandbox: denyRead $f"
+    done
+  else
+    for i in "${!MOUNT_SRC[@]}"; do
+      echo "csandbox: mount (${MOUNT_MODE[$i]}) ${MOUNT_SRC[$i]} -> ${MOUNT_DST[$i]}"
+    done
+  fi
   echo "csandbox: (dry run, not launching)"
   exit 0
 fi
@@ -729,6 +809,77 @@ launch_bwrap() {
     | grep -oE 'DENY [^:]+:' | sed 's/DENY //; s/:$//' | sort -u | paste -sd, - || true)"
 }
 
+launch_seatbelt() {
+  # macOS backend. Rather than reproduce bwrap + an nft-confined proxy, we drive
+  # Claude Code's OWN built-in OS sandbox (Seatbelt): it fences the filesystem
+  # and forces Bash egress through a domain-allowlisted CONNECT proxy, enforced
+  # by the OS for every Bash command and its children. We inject the policy into
+  # the same settings.json the shared code above already generates.
+  #
+  # Two layers, both written here:
+  #   sandbox.*            - governs BASH commands + children (fs scope + egress)
+  #   permissions.deny     - Read() rules so Claude's OWN Read/Grep tools (which
+  #                          run unsandboxed) also can't read the secret list
+  #
+  # Strict is mandatory, not cosmetic: allowUnsandboxedCommands=false. With
+  # Bash(*) allowed (added by the shared settings patch to kill prompts), a
+  # command hitting a non-allowed domain would otherwise fall back to the
+  # permission flow and be auto-approved UNSANDBOXED - escaping the egress
+  # boundary. Strict mode makes such a command fail instead.
+  python3 - "$CONFIG_DIR/settings.json" "$ROOT" "$SCRATCH_IN" "$MOUNT_NOTE" \
+      "$ALLOWED_DOMAINS" \
+      "$(printf '%s\n' "${HOME_SECRETS[@]}" ${SECRET_FILES[@]+"${SECRET_FILES[@]}"})" <<'PY'
+import json, os, sys
+path, root, scratch, mode, domains_csv, secrets_raw = sys.argv[1:7]
+
+with open(path) as f:
+    d = json.load(f)
+
+domains = [x for x in domains_csv.split(',') if x]
+secrets = [s for s in secrets_raw.splitlines() if s.strip()]
+
+fs = {}
+if mode == "read-only":
+    fs["allowWrite"] = [scratch]      # scratch stays writable (summaries/handoffs)
+    fs["denyWrite"] = [root]
+else:
+    fs["allowWrite"] = [root, scratch]
+if secrets:
+    fs["denyRead"] = secrets
+
+d["sandbox"] = {
+    "enabled": True,
+    "autoAllowBashIfSandboxed": True,
+    "allowUnsandboxedCommands": False,   # strict: no unsandboxed escape (see above)
+    "network": {"allowedDomains": domains},
+    "filesystem": fs,
+}
+
+# Second layer: mirror the secret denyRead as Read() deny rules for Claude's own
+# tools. Claude rule syntax: "~/x" for home, "//abs" for an absolute path; emit
+# an exact rule AND a recursive one per path so it covers files and dirs alike.
+home = os.path.expanduser("~")
+def rule_paths(p):
+    base = ("~" + p[len(home):]) if (p == home or p.startswith(home + os.sep)) else ("/" + p.lstrip("/"))
+    return [base, base.rstrip("/") + "/**"]
+deny = sorted({"Read(%s)" % rp for s in secrets for rp in rule_paths(s)})
+perms = d.setdefault("permissions", {})
+existing = set(perms.get("deny", []))
+perms["deny"] = sorted(existing | set(deny))
+
+with open(path, "w") as f:
+    json.dump(d, f, indent=2)
+PY
+
+  # No external proxy, no bwrap, no systemd slice: the sandbox is applied by
+  # claude itself from the settings above. Just run it in the project dir.
+  # (Resource caps like bwrap's MemoryMax/TasksMax have no Seatbelt equivalent.)
+  set +e
+  ( cd "$PROJECT_DIR" && exec "${CMD[@]}" )
+  RC=$?
+  set -e
+}
+
 # Mark the session RUNNING in the tasks db up front (host-side; the sandbox
 # can't reach the db). The review app uses this to show live sessions and to
 # refuse a merge/destroy on one. The post-run recorder flips it to ready/
@@ -765,7 +916,10 @@ finally:
 PY
 fi
 
-launch_bwrap
+case "$BACKEND" in
+  bwrap)    launch_bwrap ;;
+  seatbelt) launch_seatbelt ;;
+esac
 
 if [ -n "$BLOCKED" ]; then
   echo "csandbox: blocked egress this session -> $BLOCKED"
