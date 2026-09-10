@@ -1,15 +1,17 @@
 # csandbox
 
-A hardened Docker sandbox for running **Claude Code with `--dangerously-skip-permissions`
+A hardened sandbox for running **Claude Code with `--dangerously-skip-permissions`
 fully autonomously** — no approval prompts — while removing the "exfiltrate to an
 arbitrary host" risk that skip-permissions + open network would otherwise create.
+Linux-only: native namespaces via [bubblewrap](https://github.com/containers/bubblewrap),
+no daemon, no image, no build step.
 
-`csandbox` is the launcher. It runs Claude Code inside a container that:
+`csandbox` is the launcher. It runs Claude Code inside a sandbox that:
 
 - has **no direct route to the internet** — all egress is forced through a proxy
-  sidecar that only allows an explicit domain allowlist;
-- runs as a **non-root user** (uid 1000), no added capabilities;
-- **never mounts the docker socket** (mounting it is a full host escape);
+  that only allows an explicit domain allowlist, enforced by an nft rule scoped
+  to a dedicated cgroup (see [Architecture](#architecture));
+- runs as the **unprivileged host user**, no added capabilities;
 - **shadows secret-shaped files** (`.env`, `*.pem`, `*.key`, `.npmrc`, ssh keys, …)
   under the mounted workspace with empty read-only files — the host files are
   never touched.
@@ -43,25 +45,28 @@ project dir go straight to `claude`.
 ## Architecture
 
 ```
-        ┌─────────────────────────────────────────────┐
-        │  internal network  (no route to internet)    │
-        │                                              │
-        │   ┌────────────┐        ┌────────────────┐   │
-        │   │  sandbox   │ ─────▶ │     proxy      │ ──┼──▶ internet
-        │   │ (claude)   │  only  │ (allowlist     │   │    (allowlisted
-        │   └────────────┘  path  │  CONNECT only) │   │     hosts only)
-        │                  out    └────────────────┘   │
-        └─────────────────────────────────────────────┘
-                                   │
-                        also on the `egress` network
+        ┌───────────────────────────────────────────────┐
+        │  csandbox.slice  (nft-restricted cgroup)        │
+        │                                                │
+        │   ┌────────────┐  127.0.0.1:8888  ┌──────────┐ │
+        │   │  bwrap ns  │ ────────────────▶ │  proxy   │ ┼──▶ internet
+        │   │  (claude)  │   only path out    │ (allow-  │ │    (allowlisted
+        │   └────────────┘                   │  list)   │ │     hosts only)
+        │                                    └──────────┘ │
+        └───────────────────────────────────────────────┘
+              (everything else from this cgroup: dropped)
 ```
 
-The `sandbox` container is attached **only** to an `internal: true` Docker network,
-so it cannot reach the internet directly. The `proxy` sidecar is the sole member of
-both the internal network and an outward-facing `egress` network, so the only way
-out is through it. The proxy (a small dependency-free Node script) permits `CONNECT`
-tunnels and HTTP requests **only** to hostnames on the allowlist and returns `403`
-for everything else.
+The sandboxed process stays in the host's normal network namespace — there's no
+container network to configure — but it's launched via `systemd-run` into a
+dedicated, persistent cgroup (`csandbox.slice`). A one-time root setup step
+(`sudo ./bwrap-setup`) installs a single nft rule scoped to that cgroup's path:
+accept traffic to the egress-proxy's loopback port, drop everything else. That
+rule is the only thing standing between the sandboxed process and the network —
+so the only way out is through the proxy. The proxy (a small dependency-free
+Node script, `egress-proxy/proxy.js`) permits `CONNECT` tunnels and HTTP requests
+**only** to hostnames on the allowlist and returns `403` for everything else.
+See `bwrap-setup`'s header for the full mechanism and why each piece is needed.
 
 > **Note:** the proxy filters by hostname and does **not** terminate TLS. See
 > [Limitations](#limitations).
@@ -120,7 +125,7 @@ profiles trade some of that for convenience.
 | `CSANDBOX_READONLY=1`    | Mount the workspace read-only.                                                           |
 | `CSANDBOX_SHELL=1`       | Drop into `bash` inside the sandbox instead of launching `claude`.                       |
 | `CSANDBOX_DRYRUN=1`      | Print the resolved config (mounts, allowlist) and exit without launching.               |
-| `CSANDBOX_DOWN=1`        | Stop the proxy sidecar and remove the networks, then exit.                              |
+| `CSANDBOX_DOWN=1`        | Stop the egress proxy, then exit.                                                        |
 
 ---
 
@@ -130,25 +135,24 @@ profiles trade some of that for convenience.
 claude-sandbox/
 ├── README.md            # this file
 ├── csandbox             # the launcher (symlinked into ~/.local/bin)
-├── Dockerfile           # the sandbox image (node + build tools + claude code)
-├── docker-compose.yml   # wires the sandbox + proxy + internal/egress networks
+├── bwrap-setup          # one-time root setup (AppArmor profile, slice, nft rule)
 ├── git-hooks/
 │   ├── post-checkout   # fires on `git worktree add`; auto-hydrates node_modules
 │   └── wt-hydrate      # clones node_modules from the main worktree (CoW), offline
 └── egress-proxy/
-    ├── Dockerfile       # tiny node:alpine image for the proxy
-    └── proxy.js         # allowlist-enforcing forward proxy (no deps)
+    └── proxy.js         # allowlist-enforcing forward proxy (no deps), run directly by bwrap
 ```
 
-State lives outside this dir in `~/.claude-sandbox/` — the container's `~/.claude`
+State lives outside this dir in `~/.claude-sandbox/` — the sandbox's `~/.claude`
 config dir (credentials, session history). It's created automatically; the login
 inside it is the sandbox's own (see Quick start).
 
 The agent also gets a persistent scratch dir: `~/.claude-sandbox/scratch` on the
-host, mounted at `/home/node/scratch` in the container. A seeded global
-`CLAUDE.md` points the agent there instead of at project `.claude/` dirs, whose
-writes always trigger Claude Code's hardcoded self-config approval prompt (it
-survives even `--dangerously-skip-permissions` + `Bash(*)`).
+host, bind-mounted at the same path inside the sandbox (bwrap reuses real host
+paths rather than remapping them). A seeded global `CLAUDE.md` points the agent
+there instead of at project `.claude/` dirs, whose writes always trigger Claude
+Code's hardcoded self-config approval prompt (it survives even
+`--dangerously-skip-permissions` + `Bash(*)`).
 
 ---
 
@@ -176,12 +180,12 @@ csandbox --live .   # agent edits your checked-out working tree
 ## Parallel worktree agents
 
 The top-level agent can fan out to many subagents in parallel, each in its own
-git worktree (`Agent(isolation: "worktree")`), all inside the one container.
+git worktree (`Agent(isolation: "worktree")`), all inside the one sandbox.
 Worktrees don't inherit `node_modules` (it's gitignored), but the parallel phase
 should be **network-quiet** — no subagent should hit the npm registry.
 
-So a system-wide `post-checkout` git hook (`git-hooks/`, installed via
-`core.hooksPath` in the image) fires whenever a worktree is created and clones
+So a system-wide `post-checkout` git hook (`git-hooks/`, installed per-run via
+`GIT_CONFIG_SYSTEM`) fires whenever a worktree is created and clones
 `node_modules` from the repo's main worktree — copy-on-write where the host fs
 supports it, offline always. It's guarded to run only on worktree creation (null
 prev-SHA in a linked worktree), is idempotent, and is monorepo-aware (mirrors
@@ -225,8 +229,8 @@ active).
 Already installed on this machine. To reproduce elsewhere:
 
 ```bash
-# 1. build the images
-docker compose -f ~/hyper/claude-sandbox/docker-compose.yml -p claude-sandbox build
+# 1. one-time root setup: AppArmor profile, persistent systemd slice, nft rule
+sudo ~/hyper/claude-sandbox/bwrap-setup
 
 # 2. put the launcher on PATH
 ln -sf ~/hyper/claude-sandbox/csandbox ~/.local/bin/csandbox
@@ -236,24 +240,29 @@ cd ~/dev/linker && npm install && npm link
 linker register corestore ~/hyper/corestore   # once per local dep
 ```
 
-Requires: Docker with the Compose plugin. On first launch, log the sandbox in
-with `CSANDBOX_EXTRA_DOMAINS=claude.ai csandbox .` then `/login` inside.
+Requires: Linux, with `bubblewrap`, `nftables`, `apparmor`, and a systemd user
+session (see `bwrap-setup`'s header for exactly why each is needed). On first
+launch, log the sandbox in with `CSANDBOX_EXTRA_DOMAINS=claude.ai csandbox .`
+then `/login` inside.
 
 ---
 
 ## Maintenance
 
-- **Rebuild after changing the Dockerfile or proxy:**
-  ```bash
-  docker compose -f ~/hyper/claude-sandbox/docker-compose.yml -p claude-sandbox build
-  ```
-  (The launcher also builds quietly on each run, so a manual rebuild is only needed
-  to force a fresh pull.)
+- **Changing the proxy:** there's no build step — `egress-proxy/proxy.js` runs
+  directly via `node`. The launcher reuses a running proxy instance unless the
+  resolved allowlist changed since it started, restarting it otherwise; to force
+  a restart regardless (e.g. after editing `proxy.js`), tear it down first.
 
-- **Update the Claude Code version:** it's pinned at image build time (installed
-  globally, autoupdater disabled). Rebuild the image to pick up a new release.
+- **Update the Claude Code version:** it's whatever `claude` resolves to on the
+  host `PATH` (bwrap bind-mounts the host's node/claude install read-only,
+  autoupdater disabled inside the sandbox) — update it on the host as usual.
 
 - **Tear down the running proxy:** `CSANDBOX_DOWN=1 csandbox`.
+
+- **Re-run `bwrap-setup`:** safe any time (every step replaces its prior state);
+  needed again only if the AppArmor profile, slice, or nft rule get reset
+  (e.g. after certain system upgrades).
 
 ---
 
@@ -268,6 +277,13 @@ with `CSANDBOX_EXTRA_DOMAINS=claude.ai csandbox .` then `/login` inside.
   TLS-terminating proxy with its own CA installed in the container that validates the
   inner Host/path — **not built here**; add it if your threat model needs defense
   against a genuinely adversarial in-sandbox process.
+
+- **No `--open-egress` yet.** UDP/P2P traffic (Hyperswarm holepunch, QUIC, …) has
+  no hostname to allowlist, so the HTTP `CONNECT` proxy can't serve it at all — it
+  needs a genuinely wider network route for the session. That existed under the
+  old docker backend; it hasn't been rebuilt for bwrap yet (would need a second
+  pre-provisioned systemd slice + accept-all nft rule). Follow-up work, not
+  currently available.
 
 - **API quota.** The sandbox login lets the sandboxed agent spend your Anthropic
   quota — inherent to it being able to run Claude at all.
@@ -288,8 +304,8 @@ with `CSANDBOX_EXTRA_DOMAINS=claude.ai csandbox .` then `/login` inside.
   inside the mount but outside the project dir don't trip the "outside working
   directory" trust prompt (Claude otherwise only trusts its launch dir).
 - Claude Code's *own* inner bash-sandbox is disabled in `~/.claude-sandbox/settings.json`
-  (`sandbox.enabled: false`), because the container is the real isolation boundary and
-  running both layers was redundant and caused spurious approval gates.
+  (`sandbox.enabled: false`), because the bwrap/nft layer is the real isolation boundary
+  and running both layers was redundant and caused spurious approval gates.
 - **Why not `bypassPermissions`?** This account carries an org-managed remote
   setting — `permissions.disableBypassPermissionsMode: "disable"` in
   `~/.claude-sandbox/remote-settings.json`, fetched from Anthropic's server — that
@@ -307,7 +323,7 @@ with `CSANDBOX_EXTRA_DOMAINS=claude.ai csandbox .` then `/login` inside.
   suppresses Claude's built-in text-processing (`awk`/`perl`/`sed`) and
   shell-expansion heuristics. Read-only tools never prompt; outward-publishing tools
   (`Artifact`, `ShareOnboardingGuide`) are deliberately left to prompt. This is safe
-  because the Docker layer, not the permission engine, is the actual security
+  because the bwrap/nft layer, not the permission engine, is the actual security
   boundary.
 - **Residual prompts that survive even this** (they only relax in true bypass mode,
   which is unavailable here): writes under protected dirs — `.claude`, `.git`,

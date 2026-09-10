@@ -69,8 +69,9 @@ SQL lean and avoid sync drift; fine at our scale (few sessions).
 
 ### Per-session scratch — append-only event logs
 
-`scratch/sessions/<id>/` (host `~/.claude-sandbox/scratch/...`, container
-`/home/node/scratch/...` — same files, both sides writable):
+`scratch/sessions/<id>/` (`~/.claude-sandbox/scratch/...` — bwrap bind-mounts
+this path into the sandbox unchanged, so it's the same path on both sides,
+both writable):
 
 | file | env var | shape | writer |
 |------|---------|-------|--------|

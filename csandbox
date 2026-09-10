@@ -3,24 +3,18 @@
 # csandbox [project-dir] [claude args...]
 #
 # Default launcher for running Claude Code with --dangerously-skip-permissions
-# inside a hardened sandbox. Two backends (CSANDBOX_BACKEND, default docker):
+# inside a hardened sandbox: native Linux namespaces (bubblewrap), no daemon,
+# no image, no build step. Linux-only. One-time root setup required first:
+# `sudo ./bwrap-setup` (see that script's header for what it does and why).
 #
-#   docker (default) - Docker Compose: a sandbox container with NO direct
-#     route to the internet; all egress passes through the `proxy` sidecar,
-#     which only allows connections to an explicit domain allowlist.
+# The sandboxed process stays in the host's normal network namespace, but is
+# launched into a dedicated systemd/cgroup slice that a one-time nft rule
+# (installed by bwrap-setup) restricts to the egress-proxy's loopback port
+# only - so the only route out is through the proxy's domain allowlist below.
 #
-#   bwrap - native Linux namespaces (bubblewrap), no daemon/image/build step.
-#     Same egress-proxy allowlist, enforced via an nft rule scoped to a
-#     dedicated cgroup instead of a separate container network. One-time
-#     root setup required first: `sudo ./bwrap-setup` (see that script's
-#     header for what it does and why). Linux-only; doesn't yet support
-#     --open-egress.
-#
-# Both backends share:
-#   - run as the non-root/unprivileged user, no added capabilities
+#   - runs as the non-root/unprivileged user, no added capabilities
 #   - known secret-shaped files under the mounted root are shadowed with an
 #     empty read-only file inside the sandbox (host files are untouched)
-#   - the same egress-proxy allowlist logic and profiles
 #
 # EGRESS ALLOWLIST
 #   The allowlist is built from three layers, unioned and deduped:
@@ -60,56 +54,25 @@
 #   CSANDBOX_SHELL=1 csandbox .                  # drop into bash, not claude
 #   csandbox --live .                            # edit the working tree directly (no worktree)
 #   CSANDBOX_DRYRUN=1 csandbox .                 # print resolved config & exit
-#   CSANDBOX_DOWN=1 csandbox                     # stop the proxy sidecar & exit
-#   CSANDBOX_BACKEND=bwrap csandbox .            # native-Linux bwrap backend
+#   CSANDBOX_DOWN=1 csandbox                     # stop the egress proxy & exit
 
 set -euo pipefail
 
-# --- portability shims (Linux + macOS) ------------------------------------
-# The container internals stay Linux; this is only the HOST-side launcher, which
-# must also run on a macOS host. macOS lacks `readlink -f` (older releases) and
-# `/proc`, so avoid both here.
-resolve () {  # portable `readlink -f`: follow a symlink chain by hand
-  local p="$1" t
-  while [ -L "$p" ]; do
-    t="$(readlink "$p")"                                  # no -f: one level, works on both
-    case "$t" in /*) p="$t" ;; *) p="$(cd "$(dirname "$p")" && pwd)/$t" ;; esac
-  done
-  printf '%s\n' "$p"
-}
-gen_uuid () {  # /proc is Linux-only; uuidgen is on both (macOS upper-cases it)
-  if [ -r /proc/sys/kernel/random/uuid ]; then cat /proc/sys/kernel/random/uuid
-  elif command -v uuidgen >/dev/null 2>&1; then uuidgen | tr '[:upper:]' '[:lower:]'
-  else python3 -c 'import uuid; print(uuid.uuid4())'
-  fi
-}
+resolve() { readlink -f "$1"; }
+gen_uuid() { cat /proc/sys/kernel/random/uuid; }
 
 SANDBOX_DIR="$(cd "$(dirname "$(resolve "${BASH_SOURCE[0]}")")" && pwd)"
-COMPOSE_FILE="$SANDBOX_DIR/docker-compose.yml"
-COMPOSE_PROJECT=claude-sandbox
-COMPOSE_FILE_ARGS=(-f "$COMPOSE_FILE")   # extra -f overrides appended below (e.g. --open-egress)
-compose() { docker compose "${COMPOSE_FILE_ARGS[@]}" -p "$COMPOSE_PROJECT" "$@"; }
 
-# --- backend selection ------------------------------------------------------
-BACKEND="${CSANDBOX_BACKEND:-docker}"
-case "$BACKEND" in
-  docker|bwrap) ;;
-  *) echo "error: unknown CSANDBOX_BACKEND '$BACKEND' (valid: docker, bwrap)" >&2; exit 1 ;;
-esac
-
-# The docker backend gives the sandbox its own fake home (/home/node); bwrap
-# has no image to define that in, so it mounts everything at its real host
-# path instead. This one variable is what lets the config/scratch/linker/
-# findings mounts below be written ONCE and shared by both backends.
-if [ "$BACKEND" = docker ]; then HOME_IN="/home/node"; else HOME_IN="$HOME"; fi
-
-# Same story for wrapper binaries (linker/findings/git-hooks): docker's image
-# has a real, writable /usr/local/bin; bwrap's /usr is a read-only bind of the
-# actual host /usr, so a NEW file can't be created under it (the underlying
-# directory is root-owned - a "rw" bind doesn't change real DAC permissions).
-# /opt is never bound from the host at all in either backend, so bwrap can
-# freely create a fresh tree there instead.
-if [ "$BACKEND" = docker ]; then BIN_IN="/usr/local/bin"; else BIN_IN="/opt/csandbox-tools/bin"; fi
+# bwrap has no image to define a fake home in, so it mounts everything at its
+# real host path instead. HOME_IN/BIN_IN are used throughout below so the
+# config/scratch/linker/findings mounts are only written once.
+HOME_IN="$HOME"
+# /usr is a read-only bind of the actual host /usr, so a NEW file can't be
+# created under it (the underlying directory is root-owned - a "rw" bind
+# doesn't change real DAC permissions). /opt is never bound from the host at
+# all, so we can freely create a fresh tree there instead for wrapper
+# binaries (linker/findings/git-hooks).
+BIN_IN="/opt/csandbox-tools/bin"
 
 PROXY_PORT="${CSANDBOX_PROXY_PORT:-8888}"
 CONFIG_DIR="$HOME/.claude-sandbox"
@@ -117,40 +80,35 @@ mkdir -p "$CONFIG_DIR"
 
 # teardown shortcut
 if [ "${CSANDBOX_DOWN:-}" = "1" ]; then
-  if [ "$BACKEND" = docker ]; then
-    compose down
+  pidfile="$CONFIG_DIR/bwrap-proxy.pid"
+  if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+    kill "$(cat "$pidfile")" 2>/dev/null || true
+    echo "csandbox: stopped the egress proxy (pid $(cat "$pidfile"))"
   else
-    pidfile="$CONFIG_DIR/bwrap-proxy.pid"
-    if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
-      kill "$(cat "$pidfile")" 2>/dev/null || true
-      echo "csandbox: stopped the bwrap-mode egress proxy (pid $(cat "$pidfile"))"
-    else
-      echo "csandbox: no bwrap-mode egress proxy running"
-    fi
-    rm -f "$pidfile" "$CONFIG_DIR/bwrap-proxy.domains"
+    echo "csandbox: no egress proxy running"
   fi
+  rm -f "$pidfile" "$CONFIG_DIR/bwrap-proxy.domains"
   exit 0
 fi
 
-# --- bwrap backend preflight -------------------------------------------------
+# --- preflight ---------------------------------------------------------------
 # Fails fast, before any of the setup work below, if the one-time root step
 # (bwrap-setup) hasn't been run - never invoked automatically from here.
 bwrap_preflight() {
-  [ "$(uname -s)" = "Linux" ] || { echo "csandbox: CSANDBOX_BACKEND=bwrap only works on Linux" >&2; exit 1; }
+  [ "$(uname -s)" = "Linux" ] || { echo "csandbox: only works on Linux" >&2; exit 1; }
   command -v bwrap >/dev/null 2>&1 || { echo "csandbox: bwrap (bubblewrap) not installed - apt install bubblewrap" >&2; exit 1; }
-  command -v systemd-run >/dev/null 2>&1 || { echo "csandbox: systemd-run not found - the bwrap backend needs a systemd user session" >&2; exit 1; }
+  command -v systemd-run >/dev/null 2>&1 || { echo "csandbox: systemd-run not found - csandbox needs a systemd user session" >&2; exit 1; }
   if [ ! -f /etc/apparmor.d/bwrap-csandbox ]; then
     echo "csandbox: one-time setup not done yet - run: sudo $SANDBOX_DIR/bwrap-setup" >&2
     exit 1
   fi
 }
-[ "$BACKEND" = bwrap ] && bwrap_preflight
+bwrap_preflight
 
-# --- backend-neutral mount list ---------------------------------------------
+# --- mount list ---------------------------------------------------------
 # Every mount csandbox wants - workspace, config, scratch, linker/findings,
-# secret shadows, git-hooks - is recorded here once and translated per-
-# backend at launch time (`-v src:dst[:ro]` for docker, `--ro-bind`/`--bind`
-# for bwrap), so that wiring isn't duplicated between the two launch paths.
+# secret shadows, git-hooks - is recorded here once and translated to
+# `--ro-bind`/`--bind` args at launch time.
 MOUNT_MODE=(); MOUNT_SRC=(); MOUNT_DST=()
 add_mount() { MOUNT_MODE+=("$1"); MOUNT_SRC+=("$2"); MOUNT_DST+=("$3"); }  # add_mount <ro|rw> <src> <dst>
 
@@ -159,31 +117,17 @@ LIVE=0
 NAME=""
 FINDINGS="${CSANDBOX_FINDINGS:-1}"   # external memory: on by default; --no-findings / CSANDBOX_FINDINGS=0 disables
 FINDINGS_EXPLICIT=0                    # set by --findings; warn only then if the tool is missing
-OPEN_EGRESS=0                          # --open-egress: direct unfiltered route out (UDP/P2P), bypasses the allowlist
 ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --live) LIVE=1; shift ;;
     --findings) FINDINGS=1; FINDINGS_EXPLICIT=1; shift ;;   # explicit on (already the default)
     --no-findings) FINDINGS=0; shift ;;                     # opt out of the findings memory
-    --open-egress) OPEN_EGRESS=1; shift ;;                  # DIRECT unfiltered egress (UDP/P2P); bypasses the proxy allowlist
     --name) NAME="${2:-}"; shift 2 2>/dev/null || shift ;;   # human label for the review UI
     *)      ARGS+=("$1"); shift ;;
   esac
 done
 set -- "${ARGS[@]+"${ARGS[@]}"}"
-
-if [ "$OPEN_EGRESS" = 1 ]; then
-  if [ "$BACKEND" = bwrap ]; then
-    echo "error: --open-egress isn't supported yet under CSANDBOX_BACKEND=bwrap" >&2
-    exit 1
-  fi
-  # --open-egress: layer in the override that also attaches the sandbox to the
-  # `egress` bridge, giving it a DIRECT route to the internet (all TCP + UDP) for
-  # workloads the HTTP-only proxy can't serve (e.g. UDP P2P / holepunch). This is a
-  # deliberate loosening of the isolation for the session; the launch banner warns.
-  COMPOSE_FILE_ARGS+=(-f "$SANDBOX_DIR/docker-compose.open-egress.yml")
-fi
 
 # first arg is the project dir if it's a directory, otherwise default to cwd
 if [ $# -gt 0 ] && [ -d "$1" ]; then
@@ -247,16 +191,9 @@ mkdir -p "$(dirname "$TASKS_DB")"
 # $CSANDBOX_SCRATCH env var.
 SCRATCH_DIR="$CONFIG_DIR/scratch"
 mkdir -p "$SCRATCH_DIR"
-# docker renames these to a fixed container-side path (its image's HOME is
-# /home/node, not the real host $CONFIG_DIR/$SCRATCH_DIR names); bwrap mounts
-# everything at its own real host path instead, so it just reuses them as-is.
-if [ "$BACKEND" = docker ]; then
-  SCRATCH_IN="/home/node/scratch"
-  CONFIG_IN="/home/node/.claude"
-else
-  SCRATCH_IN="$SCRATCH_DIR"
-  CONFIG_IN="$CONFIG_DIR"
-fi
+# bwrap mounts everything at its own real host path, so these are reused as-is.
+SCRATCH_IN="$SCRATCH_DIR"
+CONFIG_IN="$CONFIG_DIR"
 add_mount rw "$CONFIG_DIR" "$CONFIG_IN"
 add_mount rw "$SCRATCH_DIR" "$SCRATCH_IN"
 
@@ -688,21 +625,18 @@ else
     # it never leaks into non --findings runs. Same mechanism as --live above.
     CLAUDE_ARGS+=(--append-system-prompt "An external 'findings' memory (a shared cross-session store) is available this session. Before investigating anything non-trivial, run 'findings recall <terms>' first - a past session may have already worked it out. When you learn something durable that isn't obvious from the code (a mechanism or gotcha, a decision and why, or a fact about the user/environment), record it with 'findings record'. Full usage guide: /opt/findings/skills/findings.md. This is opt-in test tooling - use it alongside your normal workflow.")
   fi
-  if [ "$BACKEND" = bwrap ]; then
-    CLAUDE_ENV+=("HTTP_PROXY=http://127.0.0.1:$PROXY_PORT" "HTTPS_PROXY=http://127.0.0.1:$PROXY_PORT" "NO_PROXY=localhost,127.0.0.1")
-  fi
+  CLAUDE_ENV+=("HTTP_PROXY=http://127.0.0.1:$PROXY_PORT" "HTTPS_PROXY=http://127.0.0.1:$PROXY_PORT" "NO_PROXY=localhost,127.0.0.1")
   CMD=(env "${CLAUDE_ENV[@]}" claude "${CLAUDE_ARGS[@]}" "$@")
 fi
 
 # --- launch -------------------------------------------------------------
-echo "csandbox: backend=$BACKEND, mount $ROOT ($MOUNT_NOTE), $SCRUB_COUNT secret file(s) shadowed"
+echo "csandbox: mount $ROOT ($MOUNT_NOTE), $SCRUB_COUNT secret file(s) shadowed"
 echo "csandbox: egress allowlist -> $ALLOWED_DOMAINS"
 [ -n "$LINKER_DIR" ] && echo "csandbox: linker -> $LINKER_DIR (declarative local links wired per-worktree)"
 [ -n "$FINDINGS_DIR" ] && echo "csandbox: findings -> $FINDINGS_DIR (external memory at ~/.findings, telemetry on; --no-findings to disable)"
-[ "$OPEN_EGRESS" = 1 ] && echo "csandbox: --open-egress -> DIRECT unfiltered egress this session (all TCP+UDP); the proxy allowlist is NOT a hard boundary (well-behaved HTTP still prefers the proxy)"
 [ "$LIVE" = 1 ] && echo "csandbox: --live -> agent edits the working tree directly (no top-level worktree)"
 
-# dry run: show resolved config and stop before touching docker/bwrap
+# dry run: show resolved config and stop before launching bwrap
 if [ "${CSANDBOX_DRYRUN:-}" = "1" ]; then
   echo "csandbox: workdir $PROJECT_DIR"
   for i in "${!MOUNT_SRC[@]}"; do
@@ -715,38 +649,9 @@ fi
 RC=0
 BLOCKED=""
 
-launch_docker() {
-  # build images quietly (only rebuilds on change; fast when cached)
-  compose build --quiet 2>/dev/null || compose build
-
-  # (re)create the proxy with the current allowlist (compose recreates it when
-  # ALLOWED_DOMAINS differs from the running instance)
-  compose up -d proxy >/dev/null 2>&1
-  local since; since="$(date -u +%Y-%m-%dT%H:%M:%S)"
-
-  local docker_mounts=()
-  local i
-  for i in "${!MOUNT_SRC[@]}"; do
-    if [ "${MOUNT_MODE[$i]}" = ro ]; then
-      docker_mounts+=(-v "${MOUNT_SRC[$i]}:${MOUNT_DST[$i]}:ro")
-    else
-      docker_mounts+=(-v "${MOUNT_SRC[$i]}:${MOUNT_DST[$i]}")
-    fi
-  done
-
-  set +e
-  compose run --rm "${docker_mounts[@]}" -w "$PROJECT_DIR" sandbox "${CMD[@]}"
-  RC=$?
-  set -e
-
-  # report any hosts blocked during this session so the user knows what to add
-  BLOCKED="$(compose logs proxy --since "$since" 2>/dev/null \
-    | grep -oE 'DENY [^:]+:' | sed 's/DENY //; s/:$//' | sort -u | paste -sd, - || true)"
-}
-
 launch_bwrap() {
   # host-side proxy lifecycle: reuse a running instance unless the resolved
-  # allowlist changed, mirroring `compose up -d proxy`'s recreate-on-change.
+  # allowlist changed, restarting it otherwise.
   local pidfile="$CONFIG_DIR/bwrap-proxy.pid"
   local domainsfile="$CONFIG_DIR/bwrap-proxy.domains"
   local logfile="$CONFIG_DIR/bwrap-proxy.log"
@@ -779,9 +684,9 @@ launch_bwrap() {
   bw+=(--ro-bind-try "$HOME/.local/bin" "$HOME/.local/bin")
   bw+=(--ro-bind-try "$HOME/.local/share/claude" "$HOME/.local/share/claude")
 
-  # git-hooks: mirrors the Dockerfile's `git config --system core.hooksPath`,
-  # but via GIT_CONFIG_SYSTEM (git 2.32+) instead of writing into /etc -
-  # /etc is bound straight from the real host read-only, and it's root-owned
+  # git-hooks: sets a system-wide `core.hooksPath` via GIT_CONFIG_SYSTEM (git
+  # 2.32+) instead of writing into /etc - /etc is bound straight from the
+  # real host read-only, and it's root-owned
   # there, so even a "rw" bind can't create a new /etc/gitconfig on top of it
   # (bind mount options don't override the underlying directory's real DAC
   # permissions). Pointing git at our own file entirely sidesteps that.
@@ -860,11 +765,7 @@ finally:
 PY
 fi
 
-if [ "$BACKEND" = docker ]; then
-  launch_docker
-else
-  launch_bwrap
-fi
+launch_bwrap
 
 if [ -n "$BLOCKED" ]; then
   echo "csandbox: blocked egress this session -> $BLOCKED"

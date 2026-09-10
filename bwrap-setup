@@ -2,10 +2,9 @@
 #
 # bwrap-setup
 #
-# One-time, root-only, idempotent setup that lets csandbox's `bwrap` backend
-# (CSANDBOX_BACKEND=bwrap) function on this host. csandbox NEVER runs this
-# itself - it only checks whether it's been run and tells you to if not. Run
-# it yourself: `sudo ./bwrap-setup`.
+# One-time, root-only, idempotent setup that lets csandbox function on this
+# host. csandbox NEVER runs this itself - it only checks whether it's been run
+# and tells you to if not. Run it yourself: `sudo ./bwrap-setup`.
 #
 # What it does, and why each part is needed:
 #

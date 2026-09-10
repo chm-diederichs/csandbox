@@ -2,8 +2,10 @@
 #
 # Auto-hydrate node_modules whenever a new git worktree is created, so parallel
 # worktree agents get working dependencies without any of them needing npm
-# egress. Installed as a system-wide core.hooksPath (see Dockerfile), so it
-# covers every repo in the mounted workspace.
+# egress. Installed as a system-wide core.hooksPath via GIT_CONFIG_SYSTEM
+# (set per-run in csandbox's launch_bwrap, pointing at
+# $CONFIG_DIR/bwrap-etc-gitconfig), so it covers every repo in the mounted
+# workspace.
 #
 # post-checkout args: <prev-head> <new-head> <branch-checkout-flag>
 # `git worktree add` runs a branch checkout whose prev-head is the null SHA

@@ -45,9 +45,11 @@ The agent (told this via the seeded `CLAUDE.md`) must:
 ## The summary artifact
 
 - **Location:** `$CSANDBOX_SUMMARY`, a per-session path csandbox provides,
-  under the scratch dir — e.g. `/home/node/scratch/sessions/<session-id>/summary.md`
-  (host: `~/.claude-sandbox/scratch/sessions/<session-id>/`). csandbox owns the
-  path (keyed by the session id it mints) and exports it into the container.
+  under the scratch dir — e.g.
+  `~/.claude-sandbox/scratch/sessions/<session-id>/summary.md` (bwrap bind-mounts
+  the real host path into the sandbox unchanged, so it's the same path on both
+  sides). csandbox owns the path (keyed by the session id it mints) and exports
+  it into the sandbox.
 - **Not committed.** It lives in scratch, outside the repo, so it never appears
   in the diff under review and survives even a no-commit session.
 - **Schema** — defined headings so the UI can render and the stuck/fact-finding

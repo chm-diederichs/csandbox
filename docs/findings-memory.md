@@ -229,10 +229,9 @@ inactivity measure over wall-clock "N days". Hard-prune
 **One SQLite file (findings + FTS5) behind a mounted `findings` CLI** — the
 `linker` precedent. A write is instantly visible to concurrent sessions (no
 reindex lag → serves the live requirement), and the CLI is the single writer
-path (WAL + `busy_timeout` serialize low-frequency writes). Caveat: relies on
-SQLite file locking on the bind mount — fine on **native Linux Docker** (real
-local FS); on Docker Desktop/virtiofs, fall back to append-only `findings.jsonl`
-+ a host-maintained index.
+path (WAL + `busy_timeout` serialize low-frequency writes). Relies on SQLite
+file locking on the bind mount — fine under bwrap (a real local-FS bind, not a
+network or virtualized filesystem).
 
 **CLI verbs** (where the design lives, more than the columns):
 - `record` — recall-first, then insert (with the author's first corroboration).
