@@ -427,7 +427,9 @@ fi
 # rather than a copy of the host credentials: OAuth refresh tokens rotate,
 # so a seeded copy dies as soon as the host client refreshes. First run:
 #   CSANDBOX_EXTRA_DOMAINS=claude.ai csandbox .   # then /login inside
-if [ ! -f "$CONFIG_DIR/.credentials.json" ]; then
+# Skipped on seatbelt: macOS stores the token in the Keychain, not a
+# .credentials.json file, so this check would false-warn on every run.
+if [ "$BACKEND" != seatbelt ] && [ ! -f "$CONFIG_DIR/.credentials.json" ]; then
   echo "csandbox: no sandbox login yet - run /login inside (needs claude.ai allowed):"
   echo "csandbox:   CSANDBOX_EXTRA_DOMAINS=claude.ai csandbox ."
 fi
