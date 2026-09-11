@@ -66,7 +66,15 @@ server.on('connect', (req, clientSocket, head) => {
   }
   log('ALLOW', host, port);
 
+  // Keepalive probes on both legs of the tunnel: without them, an idle
+  // streaming connection (e.g. between turns) can sit quiet long enough for
+  // a NAT/firewall on the network path to reclaim its state and silently
+  // drop it - neither side notices until the next write fails. 30s is well
+  // under the ~5min idle timeout common on home/corporate NAT and cloud NAT
+  // gateways.
+  clientSocket.setKeepAlive(true, 30_000);
   const upstream = net.connect(port, host, () => {
+    upstream.setKeepAlive(true, 30_000);
     clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
     upstream.write(head);
     upstream.pipe(clientSocket);
