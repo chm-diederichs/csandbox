@@ -84,8 +84,11 @@ until it is.
 | findings (tool repo) | re-deriving what a past session learned | ours |
 
 Always-on rules seeded by csandbox: worker contract, lane table before
-fan-out, edit gate. Hook: `edit-gate` (first edit to an existing source file
-is blocked once with a fact request - importers across the workspace, exports
-touched, formats). All from a 2026-09 read of ECC (github.com/affaan-m/ECC);
+fan-out. Hook (opt-in, `CSANDBOX_EDIT_GATE=1`): `edit-gate` refuses the first
+edit to an existing source file once with a fact request. Switched off by
+default on 2026-09-24 after a session took the refusal as "done" and ran the
+tests without the edit landing - a hook that refuses a tool call needs the
+agent to retry, and that did not reliably happen. Lesson for hooks in general:
+prefer injecting context (UserPromptSubmit, SessionStart) over refusing calls. All from a 2026-09 read of ECC (github.com/affaan-m/ECC);
 nothing was taken verbatim, and the rest of that repo was judged not worth
 porting (see `findings-memory.md` "Prior art").

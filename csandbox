@@ -168,7 +168,7 @@ LIVE=1                                 # default: agent edits the checked-out tr
 [ "${CSANDBOX_WORKTREE:-0}" = 1 ] && LIVE=0
 FINDINGS="${CSANDBOX_FINDINGS:-1}"   # external memory: on by default; --no-findings / CSANDBOX_FINDINGS=0 disables
 FINDINGS_EXPLICIT=0                    # set by --findings; warn only then if the tool is missing
-EDIT_GATE="${CSANDBOX_EDIT_GATE:-1}"   # PreToolUse fact-forcing gate on first edits (claude-hooks/edit-gate); 0 disables
+EDIT_GATE="${CSANDBOX_EDIT_GATE:-0}"   # OPT-IN PreToolUse fact-forcing gate on first edits (claude-hooks/edit-gate); 1 enables. Off by default: agents were observed treating the refusal as done and moving on without the edit
 ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -328,9 +328,9 @@ fi
 # version (identified by a phrase only the old text had) so the guards below
 # re-append the current one. A section runs from its "# heading" to the next
 # "# " line.
-python3 - "$CONFIG_DIR/CLAUDE.md" <<'PY'
+python3 - "$CONFIG_DIR/CLAUDE.md" "$EDIT_GATE" <<'PY'
 import re, sys
-p = sys.argv[1]
+p, edit_gate = sys.argv[1], sys.argv[2]
 try:
     s = open(p).read()
 except FileNotFoundError:
@@ -343,6 +343,8 @@ def drop(s, heading, stale):
 s = drop(s, 'Top-level session worktree', 'at the start of every session in a git repo, call `EnterWorktree`')
 s = drop(s, 'Parallel worktree subagents', "nested under the\ntop-level session's own worktree")
 s = drop(s, 'Session output', 'COMMIT your work on the worktree branch before finishing')
+if edit_gate != '1':
+    s = drop(s, 'Edit gate', 'edit gate hook')   # section only belongs when the gate is on
 open(p, 'w').write(s)
 PY
 if ! grep -q 'launched with `csandbox --worktree`' "$CONFIG_DIR/CLAUDE.md" 2>/dev/null; then
@@ -607,7 +609,10 @@ fi
 # are active. edit-gate (PreToolUse Edit|Write) is independent of findings: it
 # blocks the FIRST edit to an existing source file once per session with a
 # fact request (importers across the workspace, affected exports, formats) -
-# see claude-hooks/edit-gate. CSANDBOX_EDIT_GATE=0 disables it.
+# see claude-hooks/edit-gate. OPT-IN via CSANDBOX_EDIT_GATE=1: with it on by
+# default, agents were seen taking the refusal as "done" and moving on to run
+# tests without the edit ever landing (2026-09-24), which is worse than the
+# importer blind spot it guards against.
 for _h in memory-findings-nudge findings-hook edit-gate; do
   cp "$SANDBOX_DIR/claude-hooks/$_h" "$LOCAL_SHARE_DIR/$_h"
   chmod +x "$LOCAL_SHARE_DIR/$_h"

@@ -127,7 +127,7 @@ profiles trade some of that for convenience.
 | `CSANDBOX_DRYRUN=1`      | Print the resolved config (mounts, allowlist) and exit without launching.               |
 | `CSANDBOX_DOWN=1`        | Stop the egress proxy, then exit.                                                        |
 | `CSANDBOX_WORKTREE=1`    | Agent works on a disposable session worktree instead of your tree (`--worktree` does the same). |
-| `CSANDBOX_EDIT_GATE=0`   | Disable the edit gate hook (first edit to an existing source file is otherwise blocked once with a fact request). |
+| `CSANDBOX_EDIT_GATE=1`   | Enable the opt-in edit gate hook: the first edit to an existing source file is refused once with a fact request (importers, exports, formats). Off by default. |
 | `CSANDBOX_FINDINGS=0`    | Disable the findings memory for this run (`--no-findings` does the same).                |
 
 ---
@@ -143,7 +143,7 @@ claude-sandbox/
 │   ├── post-checkout   # fires on `git worktree add`; auto-hydrates node_modules
 │   └── wt-hydrate      # clones node_modules from the main worktree (CoW), offline
 ├── claude-hooks/        # Claude Code lifecycle hooks, mounted + registered per launch
-│   ├── edit-gate              # PreToolUse: first edit to a source file asks for importers/exports/formats once
+│   ├── edit-gate              # PreToolUse (opt-in, CSANDBOX_EDIT_GATE=1): first edit asks for importers/exports/formats once
 │   ├── findings-hook          # prompt: auto-recall · stop: record nudge · compact: re-inject
 │   └── memory-findings-nudge  # PostToolUse: mirror auto-memory writes into findings
 ├── skills/              # harness-level skills, copied into the sandbox config each launch (docs/skills.md)
@@ -266,12 +266,12 @@ sandbox config dir on every launch, where Claude Code discovers them
 always-on rules are seeded into the sandbox `CLAUDE.md`: the worker contract
 (final message is the deliverable, never end a turn with children running, one
 task then stop), a lane table before fanning out (parallel only when write
-surfaces don't collide), and the edit gate. The edit gate is a `PreToolUse`
-hook that blocks the first edit to an existing source file once per session
-until the agent lists the module's importers across the workspace, the exports
-it touches and any formats involved - the poly-repo's characteristic failure is
-a one-repo change that breaks its importers. How skills are written, placed and
-tested: `docs/skills.md`.
+surfaces don't collide). An opt-in edit gate (`CSANDBOX_EDIT_GATE=1`) adds a
+`PreToolUse` hook that refuses the first edit to an existing source file once
+per session until the agent lists the module's importers across the workspace,
+the exports it touches and any formats involved. It is off by default: agents
+were observed treating the refusal as done and moving on without the edit. How
+skills are written, placed and tested: `docs/skills.md`.
 
 ---
 
