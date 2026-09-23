@@ -167,6 +167,7 @@ add_mount() { MOUNT_MODE+=("$1"); MOUNT_SRC+=("$2"); MOUNT_DST+=("$3"); }  # add
 LIVE=0
 FINDINGS="${CSANDBOX_FINDINGS:-1}"   # external memory: on by default; --no-findings / CSANDBOX_FINDINGS=0 disables
 FINDINGS_EXPLICIT=0                    # set by --findings; warn only then if the tool is missing
+EDIT_GATE="${CSANDBOX_EDIT_GATE:-1}"   # PreToolUse fact-forcing gate on first edits (claude-hooks/edit-gate); 0 disables
 ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -377,6 +378,46 @@ creates a reviewable diff; uncommitted changes are invisible to anyone
 reviewing the branch later.
 EOF
 fi
+if ! grep -q 'own collection' "$CONFIG_DIR/CLAUDE.md" 2>/dev/null; then
+  cat >> "$CONFIG_DIR/CLAUDE.md" <<'EOF'
+
+# Worker contract (you, and every subagent you brief)
+Your final message IS the deliverable - put the result in it, not "done, see
+above". Never end a turn while background agents you spawned are still
+running: ending orphans their results. If you delegate, you own collection.
+One task, one branch, then stop - no independent "review" of your own output
+as if it came from someone else; spawn a fresh reviewer if a review is wanted.
+If blocked, stop and say exactly what is needed; do not poll, sleep, or retry
+the same action with different wording. Decompose only when the work cannot
+fit in one context.
+EOF
+fi
+if ! grep -q 'write surface' "$CONFIG_DIR/CLAUDE.md" 2>/dev/null; then
+  cat >> "$CONFIG_DIR/CLAUDE.md" <<'EOF'
+
+# Before fanning out
+Write the lane table first: `lane | write surface (files/dirs/repos) | done
+when | verify by`. Run lanes in parallel ONLY when their write surfaces do not
+collide - two agents editing the same file or the same shared dep produce a
+merge nobody can review. Each lane gets an explicit done condition and one
+verification command; brief it with the preflight block (`autonomous-preflight`
+skill). End the fan-out with a verification table (lane, command, result), not
+a speed claim.
+EOF
+fi
+if [ "$EDIT_GATE" = 1 ] && ! grep -q 'edit gate' "$CONFIG_DIR/CLAUDE.md" 2>/dev/null; then
+  cat >> "$CONFIG_DIR/CLAUDE.md" <<'EOF'
+
+# Edit gate
+The first edit to an existing source file in a session is blocked ONCE by an
+edit gate hook that asks for facts: who imports the module across the whole
+workspace, which exports change, any persisted/wire formats involved, and the
+instruction you are acting on. Establish them (grep the workspace, read the
+callers), state them briefly, then re-issue the same edit - it passes. This
+is not an error; it exists because repos here consume each other and a
+one-repo change silently breaks its importers.
+EOF
+fi
 if ! grep -q 'Crossing repos' "$CONFIG_DIR/CLAUDE.md" 2>/dev/null; then
   cat >> "$CONFIG_DIR/CLAUDE.md" <<'EOF'
 
@@ -539,27 +580,32 @@ if [ -n "$FINDINGS_DIR" ]; then
   #                          a substantial session that recorded nothing
   #   findings-hook compact  SessionStart(compact) - re-injects the claims shown
   #                          before compaction + a record nudge
-  # Every script exits 0 silently unless FINDINGS_DB is set (only when this block
-  # ran), so a stale registration can never break a --no-findings run.
-  for _h in memory-findings-nudge findings-hook; do
-    cp "$SANDBOX_DIR/claude-hooks/$_h" "$LOCAL_SHARE_DIR/$_h"
-    chmod +x "$LOCAL_SHARE_DIR/$_h"
-    add_mount ro "$LOCAL_SHARE_DIR/$_h" "$BIN_IN/$_h"
-  done
-  if [ "$BACKEND" = seatbelt ]; then HOOKS_IN="$LOCAL_SHARE_DIR"; else HOOKS_IN="$BIN_IN"; fi
+  # Every findings script exits 0 silently unless FINDINGS_DB is set (only when
+  # this block ran), so a stale registration can never break a --no-findings run.
 fi
+# All hook scripts are mounted regardless; registration below decides which
+# are active. edit-gate (PreToolUse Edit|Write) is independent of findings: it
+# blocks the FIRST edit to an existing source file once per session with a
+# fact request (importers across the workspace, affected exports, formats) -
+# see claude-hooks/edit-gate. CSANDBOX_EDIT_GATE=0 disables it.
+for _h in memory-findings-nudge findings-hook edit-gate; do
+  cp "$SANDBOX_DIR/claude-hooks/$_h" "$LOCAL_SHARE_DIR/$_h"
+  chmod +x "$LOCAL_SHARE_DIR/$_h"
+  add_mount ro "$LOCAL_SHARE_DIR/$_h" "$BIN_IN/$_h"
+done
+if [ "$BACKEND" = seatbelt ]; then HOOKS_IN="$LOCAL_SHARE_DIR"; else HOOKS_IN="$BIN_IN"; fi
 
 # Register (or, with findings inactive, remove) the findings hooks in the
 # persistent settings.json. Idempotent by command string: this runs on every
 # launch and settings.json persists across them, so a plain append would
 # duplicate entries every session. Matching is on our own script names, so
 # user-added hooks on the same events are left alone.
-python3 - "$CONFIG_DIR/settings.json" "${HOOKS_IN:-}" <<'EOF'
+python3 - "$CONFIG_DIR/settings.json" "$HOOKS_IN" "${FINDINGS_DIR:+1}" "$EDIT_GATE" <<'EOF'
 import json, sys
-path, hooks_in = sys.argv[1], sys.argv[2]
+path, hooks_in, findings, edit_gate = sys.argv[1], sys.argv[2], sys.argv[3] == '1', sys.argv[4] == '1'
 with open(path) as f:
     d = json.load(f)
-OURS = ('memory-findings-nudge', 'findings-hook')
+OURS = ('memory-findings-nudge', 'findings-hook', 'edit-gate')
 def is_ours(h):
     return any(('/' + n + ' ') in h.get('command', '') + ' ' for n in OURS)
 hooks = d.setdefault('hooks', {})
@@ -575,13 +621,17 @@ for ev in list(hooks):
         hooks[ev] = kept
     else:
         del hooks[ev]
-if hooks_in:
-    want = [
+want = []
+if findings:
+    want += [
         ('PostToolUse',      'Edit|Write', f'{hooks_in}/memory-findings-nudge', None),
         ('UserPromptSubmit', None,         f'{hooks_in}/findings-hook prompt',  20),
         ('Stop',             None,         f'{hooks_in}/findings-hook stop',    15),
         ('SessionStart',     'compact',    f'{hooks_in}/findings-hook compact', 15),
     ]
+if edit_gate:
+    want += [('PreToolUse', 'Edit|Write', f'{hooks_in}/edit-gate', 10)]
+if True:
     for ev, matcher, cmd, timeout in want:
         h = {'type': 'command', 'command': cmd}
         if timeout:
@@ -595,6 +645,27 @@ if not hooks:
 with open(path, 'w') as f:
     json.dump(d, f, indent=2)
 EOF
+
+# --- skills -------------------------------------------------------------
+# Harness-level skills ship in this repo under skills/<name>/SKILL.md and are
+# installed by COPY into the sandbox config dir, where Claude Code discovers
+# them as user skills (`/name`, or the model loads them by description). Copy,
+# not mount, so a skill edited on the host lands on the next launch and the
+# agent can't write back into this repo. Only our names are replaced; anything
+# else under skills/ (synced, user-added) is left alone. The findings skill is
+# installed the same way when the tool is active.
+mkdir -p "$CONFIG_DIR/skills"
+for _s in "$SANDBOX_DIR"/skills/*/; do
+  _n="$(basename "$_s")"
+  rm -rf "$CONFIG_DIR/skills/$_n"
+  cp -r "$_s" "$CONFIG_DIR/skills/$_n"
+done
+if [ -n "$FINDINGS_DIR" ] && [ -f "$FINDINGS_DIR/skills/findings.md" ]; then
+  rm -rf "$CONFIG_DIR/skills/findings"; mkdir -p "$CONFIG_DIR/skills/findings"
+  cp "$FINDINGS_DIR/skills/findings.md" "$CONFIG_DIR/skills/findings/SKILL.md"
+else
+  rm -rf "$CONFIG_DIR/skills/findings"
+fi
 
 # --- secret scrubbing -------------------------------------------------
 # Shadow known secret-shaped files under the mounted root with an empty
@@ -696,6 +767,9 @@ else
   # CSANDBOX_SESSION_ID + CSANDBOX_SNAPSHOT are inherited by subagents, so they
   # share this session's frozen snapshot and per-repo worktrees.
   [ -n "$CSANDBOX_SNAPSHOT" ] && CLAUDE_ENV+=("CSANDBOX_SNAPSHOT=$CSANDBOX_SNAPSHOT" "CSANDBOX_SESSION_ID=$SESSION_ID")
+  # per-session state for hooks (edit-gate markers); under scratch so it is
+  # agent-visible but harmless, and dies with the session dir
+  CLAUDE_ENV+=("CSANDBOX_HOOK_STATE=$SCRATCH_IN/sessions/${SESSION_ID:-nosession}/hook-state" "CSANDBOX_EDIT_GATE=$EDIT_GATE" "CSANDBOX_ROOT=$ROOT")
   CLAUDE_ARGS=(--dangerously-skip-permissions)
   [ ${#MINT_SESSION_ARGS[@]} -gt 0 ] && CLAUDE_ARGS+=("${MINT_SESSION_ARGS[@]}")
   if [ "$LIVE" = 1 ]; then

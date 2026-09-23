@@ -126,6 +126,8 @@ profiles trade some of that for convenience.
 | `CSANDBOX_SHELL=1`       | Drop into `bash` inside the sandbox instead of launching `claude`.                       |
 | `CSANDBOX_DRYRUN=1`      | Print the resolved config (mounts, allowlist) and exit without launching.               |
 | `CSANDBOX_DOWN=1`        | Stop the egress proxy, then exit.                                                        |
+| `CSANDBOX_EDIT_GATE=0`   | Disable the edit gate hook (first edit to an existing source file is otherwise blocked once with a fact request). |
+| `CSANDBOX_FINDINGS=0`    | Disable the findings memory for this run (`--no-findings` does the same).                |
 
 ---
 
@@ -140,8 +142,15 @@ claude-sandbox/
 │   ├── post-checkout   # fires on `git worktree add`; auto-hydrates node_modules
 │   └── wt-hydrate      # clones node_modules from the main worktree (CoW), offline
 ├── claude-hooks/        # Claude Code lifecycle hooks, mounted + registered per launch
+│   ├── edit-gate              # PreToolUse: first edit to a source file asks for importers/exports/formats once
 │   ├── findings-hook          # prompt: auto-recall · stop: record nudge · compact: re-inject
 │   └── memory-findings-nudge  # PostToolUse: mirror auto-memory writes into findings
+├── skills/              # harness-level skills, copied into the sandbox config each launch (docs/skills.md)
+│   ├── autonomous-preflight/  # goal/done/boundary block before any unattended run or fan-out
+│   ├── strict-review/         # reviewer brief: cite line + trigger or drop the finding
+│   ├── hunt-silent-failures/  # swallowed errors, streams/emitters that drop them
+│   ├── tdd-brittle/           # RED gate that must actually run and fail for the right reason
+│   └── perf-loop/             # bounded measure→variant→promote loop, ledger in findings
 └── egress-proxy/
     └── proxy.js         # allowlist-enforcing forward proxy (no deps), run directly by bwrap
 ```
@@ -244,6 +253,22 @@ substantial session recorded nothing; `SessionStart(compact)` re-injects what
 was shown before compaction. Every command is traced to `~/.findings/events.jsonl`
 (`findings stats`) so recall miss-rate is measurable. Design and observed
 numbers: `docs/findings-memory.md`.
+
+## Skills and rules
+
+Harness-level skills live in `skills/<name>/SKILL.md` and are copied into the
+sandbox config dir on every launch, where Claude Code discovers them
+(`autonomous-preflight`, `strict-review`, `hunt-silent-failures`,
+`tdd-brittle`, `perf-loop`, plus `findings` from its own repo). Three short
+always-on rules are seeded into the sandbox `CLAUDE.md`: the worker contract
+(final message is the deliverable, never end a turn with children running, one
+task then stop), a lane table before fanning out (parallel only when write
+surfaces don't collide), and the edit gate. The edit gate is a `PreToolUse`
+hook that blocks the first edit to an existing source file once per session
+until the agent lists the module's importers across the workspace, the exports
+it touches and any formats involved - the poly-repo's characteristic failure is
+a one-repo change that breaks its importers. How skills are written, placed and
+tested: `docs/skills.md`.
 
 ---
 
