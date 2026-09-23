@@ -1,7 +1,9 @@
 # Findings memory — design
 
-Status: **design; not built. Trimmed to a CORE to build first + DEFERRED
-machinery kept below** (see "Build scope"). An external, queryable memory so
+Status: **CORE built and in daily use** (`~/dev/findings`, mounted into every
+csandbox session by default; see "Built" below for what exists and what the
+telemetry shows). The DEFERRED machinery is kept below, unbuilt, gated on the
+metrics. An external, queryable memory so
 sessions can be **ephemeral** (small, focused, cheap) instead of long-lived
 multi-repo transcripts. Each session records distilled findings; later sessions
 retrieve the relevant slice on demand (via `recall`).
@@ -16,6 +18,62 @@ scaled with real retrieval.
 The metric that matters is **not tokens** (those favor this) but **miss-rate**
 (retrieval failed → re-derivation) and **dup-rate** (record-after-recall failed
 → store rots). Build the thinnest version and instrument those two.
+
+## Built: what exists today (2026-09-23)
+
+- **Store + CLI** (`~/dev/findings`): one SQLite file at `~/.findings/findings.db`
+  with FTS5, verbs `record` (dedup-at-write: warns on near-duplicate claims and
+  suggests `--supersedes`), `recall` (filter + BM25, two-stage), `show`,
+  `supersede`, `list`, `repos`, `stats`. Telemetry: every command appends to
+  `~/.findings/events.jsonl` (`stats` summarises it).
+- **Repo key = the main worktree.** `--repo` (given or auto-filled) is
+  canonicalised via the git common dir, falling back to the `.claude/worktrees/`
+  layout once a worktree is gone. Before this, 50 of 178 rows carried 21
+  worktree-specific or relative keys, so `--repo`-scoped recall silently missed
+  them - and the skill *telling* agents to canonicalise had not fixed it.
+  `findings repos --fix` migrated the store. Observation `sha` is taken from the
+  caller's own checkout, and staleness diffs from the merge-base, so a worktree
+  branch's sha is judged against what HEAD did to those files since the fork.
+- **Hooks in csandbox** (`claude-hooks/findings-hook`, registered in the
+  sandbox's settings.json each launch): UserPromptSubmit auto-recalls the
+  prompt's terms (this repo first, then the whole store) and injects the top
+  claims as reference-only context, never repeating an id within a session;
+  Stop nudges once, and only when a substantial session recorded nothing;
+  SessionStart(compact) re-injects the claims shown before compaction plus a
+  record nudge (PreCompact cannot reach the agent, verified against the hooks
+  docs). Hook recalls are tagged `origin: hook` in the trace so agent-initiated
+  and injected recall can be measured separately.
+- **Observed before the hooks** (64 sessions): 178 records vs 91 recalls; 13
+  sessions only recorded and 7 only recalled; 12 of 91 recalls returned nothing
+  (a lower bound on miss-rate - soft misses are not visible in the trace).
+  Re-measure after the hooks have run for a while.
+
+**Sessions are deliberately not a facet of a finding.** A session id is stamped
+on telemetry events, not on rows. The candidate benefit - "found one finding
+from a session, pull its siblings" - is a weak proxy for relatedness: a session
+spans unrelated things and a topic spans many sessions, and `thread`, `area`,
+`--repo` and FTS over `report` already express relatedness directly. Provenance
+(which session produced a row) is a debugging aid, and the trace covers it.
+The session-graph proposal (`session-graph.md`) is therefore not being pursued
+for findings.
+
+**Renames are the residual fragmentation.** The common-dir trick covers linked
+worktrees wherever they live, but a renamed main checkout leaves old keys behind
+(54 rows on `keet-core-hyperdb` after it became `keet-core`; fixed by hand with
+`findings repos --fix --map old=new`). Keying by remote URL, as ECC's observer
+does, would survive renames; not done, since it changes every key. Revisit if
+renames recur.
+
+**Prior art checked (2026-09-23): ECC** (github.com/affaan-m/ECC). Its
+cross-session continuity is a Stop hook that rewrites a per-checkout markdown
+session summary and a SessionStart hook that re-injects the last one - passive,
+whole-session, no query. Its "memory vault" is the findings analogue (typed
+markdown + lexical search over CLI/MCP) but is opt-in and unwired: no hook writes
+or reads it. Its "instincts" mine tool-call traces for repeated habits, not
+facts about code. Nothing there has staleness, repo anchoring, or telemetry.
+Two things were worth taking and are now in: repo identity via the git common
+dir, and prompt-time injection so recall does not depend on the agent choosing
+to recall.
 
 ## A finding is a durable assertion the agent should carry forward
 
@@ -247,7 +305,7 @@ The hard parts of agent memory are empirical; don't build machinery for
 imagined failure modes. Build the thin core, **instrument miss-rate and
 dup-rate**, and let observed failures earn each deferred piece.
 
-**CORE (build now):**
+**CORE (built - see "Built" above):**
 - One SQLite store + a mounted `findings` CLI. Schema: `id, kind
   (observation|decision|memory), repo, area, claim, report, files, sha, status
   (current|superseded), superseded_by, created_ts, updated_ts` + `FTS5(claim,
@@ -374,6 +432,5 @@ foreclose it.
 
 ## Adjacent / reuse
 
-`summary.md` = the unstructured seed of a finding; `tasks.db` = session metadata;
-the review-loop **catch-up marker** = the staleness mechanism; the
-per-conversation **memory system** = the small-scale proof of the pattern.
+The per-conversation **memory system** is the small-scale proof of the
+pattern this scales up from.

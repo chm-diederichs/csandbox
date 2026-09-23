@@ -8,7 +8,7 @@
 #                     proxy. One-time root setup first: `sudo ./bwrap-setup`.
 #   macOS -> seatbelt Claude Code's own built-in OS sandbox (Seatbelt) - filesystem
 #                     scoping + a domain-allowlisted egress proxy, no root/setup.
-# The workflow layer (session db, worktrees, linker, findings, CLAUDE.md
+# The workflow layer (worktrees, linker, findings + its hooks, CLAUDE.md
 # seeding) and the egress-allowlist model below are shared across both.
 #
 # The sandboxed process stays in the host's normal network namespace, but is
@@ -165,7 +165,6 @@ add_mount() { MOUNT_MODE+=("$1"); MOUNT_SRC+=("$2"); MOUNT_DST+=("$3"); }  # add
 
 # pull csandbox's own flags out of the arg list; everything else goes to claude
 LIVE=0
-NAME=""
 FINDINGS="${CSANDBOX_FINDINGS:-1}"   # external memory: on by default; --no-findings / CSANDBOX_FINDINGS=0 disables
 FINDINGS_EXPLICIT=0                    # set by --findings; warn only then if the tool is missing
 ARGS=()
@@ -174,7 +173,6 @@ while [ $# -gt 0 ]; do
     --live) LIVE=1; shift ;;
     --findings) FINDINGS=1; FINDINGS_EXPLICIT=1; shift ;;   # explicit on (already the default)
     --no-findings) FINDINGS=0; shift ;;                     # opt out of the findings memory
-    --name) NAME="${2:-}"; shift 2 2>/dev/null || shift ;;   # human label for the review UI
     *)      ARGS+=("$1"); shift ;;
   esac
 done
@@ -229,11 +227,11 @@ if [ -z "$SESSION_ID" ] && [ "$_has_session_flag" = 0 ] && [ "${CSANDBOX_SHELL:-
   MINT_SESSION_ARGS=(--session-id "$SESSION_ID")
 fi
 
-# tasks db: host-side, and OUTSIDE the bind-mounted config dir so the sandboxed
-# agent can't see or mutate it. csandbox records one row per run here on exit;
-# the review UI reads it. Override the path with CSANDBOX_TASKS_DB.
-TASKS_DB="${CSANDBOX_TASKS_DB:-$HOME/.local/share/csandbox/tasks.db}"
-mkdir -p "$(dirname "$TASKS_DB")"
+# local-share dir: host-side, OUTSIDE the bind-mounted config dir. Anchor for
+# wrapper scripts (linker/findings/memory-nudge below) that need a writable
+# spot the sandboxed agent can't see or mutate.
+LOCAL_SHARE_DIR="$HOME/.local/share/csandbox"
+mkdir -p "$LOCAL_SHARE_DIR"
 
 # Persistent scratch space for the agent. Writes under a .claude/ dir always
 # trigger Claude Code's hardcoded self-config guard (even with skip-
@@ -248,31 +246,21 @@ CONFIG_IN="$CONFIG_DIR"
 add_mount rw "$CONFIG_DIR" "$CONFIG_IN"
 add_mount rw "$SCRATCH_DIR" "$SCRATCH_IN"
 
-# Per-session summary artifact (docs/agent-contract.md): the agent writes its
-# review summary to $CSANDBOX_SUMMARY. It lives under scratch - agent-writable,
-# not committed, survives exit - namespaced by session id. Set only when the id
-# is known up front (fresh mint, or --resume/--session-id); a --continue/picker
-# run has no id yet, so it gets no summary path.
-CSANDBOX_SUMMARY=""
 CSANDBOX_MANIFEST=""
 CSANDBOX_SNAPSHOT=""
-CSANDBOX_COMMENTS=""
+# Set only when the session id is known up front (fresh mint, or
+# --resume/--session-id); a --continue/picker run has no id yet.
 if [ -n "$SESSION_ID" ]; then
   mkdir -p "$SCRATCH_DIR/sessions/$SESSION_ID"
-  CSANDBOX_SUMMARY="$SCRATCH_IN/sessions/$SESSION_ID/summary.md"
   # every worktree created this session (top-level or subagent) is appended here
-  # by the post-checkout hook; csandbox ingests it on exit to register sessions
-  # (the container can't write the tasks db, which lives outside the mount).
+  # by the post-checkout hook - path/branch/fork_sha, one line per worktree -
+  # since the sandboxed process can't write host-side state directly.
   CSANDBOX_MANIFEST="$SCRATCH_IN/sessions/$SESSION_ID/worktrees.jsonl"
   # Freeze every repo state under ROOT at spawn (branch + sha). Agents work off
   # this snapshot so concurrent host-side checkouts/commits can't disturb a
   # running session; csbox-enter-repo worktrees a repo pinned to its snapshot,
   # and subagents inherit it via the env var. ~150ms over ~/hyper (parallel).
   CSANDBOX_SNAPSHOT="$SCRATCH_IN/sessions/$SESSION_ID/snapshot.json"
-  # append-only review-comment log (docs/review-loop.md): reviewers (human via
-  # csreview, or an agent via the review skill) append comment/resolved/compiled
-  # events; one log per session, keyed {repo,branch}. Inherited by subagents.
-  CSANDBOX_COMMENTS="$SCRATCH_IN/sessions/$SESSION_ID/comments.jsonl"
   python3 - "$ROOT" "$SCRATCH_DIR/sessions/$SESSION_ID/snapshot.json" <<'PY' 2>/dev/null || true
 import glob, json, os, subprocess, sys
 from concurrent.futures import ThreadPoolExecutor
@@ -360,7 +348,7 @@ the work is done, leave the branch as-is (`ExitWorktree` with `action:
 push, open a PR, or merge it myself unless asked.
 EOF
 fi
-if ! grep -q 'do NOT ALSO call' "$CONFIG_DIR/CLAUDE.md" 2>/dev/null; then
+if ! grep -q 'should NOT ALSO call' "$CONFIG_DIR/CLAUDE.md" 2>/dev/null; then
   cat >> "$CONFIG_DIR/CLAUDE.md" <<'EOF'
 
 # Parallel worktree subagents
@@ -384,16 +372,9 @@ if ! grep -q 'Session output' "$CONFIG_DIR/CLAUDE.md" 2>/dev/null; then
   cat >> "$CONFIG_DIR/CLAUDE.md" <<'EOF'
 
 # Session output
-Produce what the reviewer will look at (see docs/agent-contract.md):
-- COMMIT your work on the worktree branch before finishing - a commit is what
-  creates a reviewable diff; uncommitted changes are invisible to branch review.
-- ALWAYS write a short summary to the file named in the `$CSANDBOX_SUMMARY`
-  environment variable (run `echo "$CSANDBOX_SUMMARY"` to get the path), even if
-  you committed nothing (got stuck, or were only fact-finding). Use the headings:
-  `## Summary`, `## Changes`, `## Open questions / needs attention`, `## Blocked on`.
-- Do NOT put review feedback in inline code comments - it pollutes the diff.
-  Session-level notes go in the summary; line-level comments come back from the
-  human via the review tool.
+COMMIT your work on the worktree branch before finishing - a commit is what
+creates a reviewable diff; uncommitted changes are invisible to anyone
+reviewing the branch later.
 EOF
 fi
 if ! grep -q 'Crossing repos' "$CONFIG_DIR/CLAUDE.md" 2>/dev/null; then
@@ -522,7 +503,7 @@ fi
 # the host registry (name->path). Host paths are valid in-container because the
 # workspace mounts at the same path.
 if [ -n "$LINKER_DIR" ]; then
-  LINKER_WRAPPER="$(dirname "$TASKS_DB")/linker-wrapper"
+  LINKER_WRAPPER="$LOCAL_SHARE_DIR/linker-wrapper"
   printf '#!/bin/sh\nexec node /opt/linker/cli.js "$@"\n' > "$LINKER_WRAPPER"
   chmod +x "$LINKER_WRAPPER"
   add_mount ro "$LINKER_DIR" /opt/linker
@@ -537,9 +518,9 @@ fi
 # and the telemetry trace). FINDINGS_EVENTS logs a recall/record trace so miss-rate
 # is measurable. Active whenever the tool was detected; --no-findings opts out.
 FINDINGS_EVENTS=""
-MEMORY_NUDGE_IN=""
+HOOKS_IN=""
 if [ -n "$FINDINGS_DIR" ]; then
-  FINDINGS_WRAPPER="$(dirname "$TASKS_DB")/findings-wrapper"
+  FINDINGS_WRAPPER="$LOCAL_SHARE_DIR/findings-wrapper"
   printf '#!/bin/sh\nexec node /opt/findings/cli.js "$@"\n' > "$FINDINGS_WRAPPER"
   chmod +x "$FINDINGS_WRAPPER"
   mkdir -p "$HOME/.findings"
@@ -547,36 +528,73 @@ if [ -n "$FINDINGS_DIR" ]; then
   add_mount ro "$FINDINGS_WRAPPER" "$BIN_IN/findings"
   add_mount rw "$HOME/.findings" "$HOME_IN/.findings"   # rw: shared store + telemetry trace
   FINDINGS_EVENTS="$HOME_IN/.findings/events.jsonl"
-  # PostToolUse hook: nudges the agent to also findings-record its own auto
-  # memory writes, since that's a nudge Claude Code itself never gives it
-  # (the two systems don't know about each other). Only wired up when
-  # findings is actually available - the nudge tells the agent to run
-  # `findings record`, which would just fail otherwise.
-  MEMORY_NUDGE_SCRIPT="$(dirname "$TASKS_DB")/memory-findings-nudge"
-  cp "$SANDBOX_DIR/claude-hooks/memory-findings-nudge" "$MEMORY_NUDGE_SCRIPT"
-  chmod +x "$MEMORY_NUDGE_SCRIPT"
-  MEMORY_NUDGE_IN="$BIN_IN/memory-findings-nudge"
-  add_mount ro "$MEMORY_NUDGE_SCRIPT" "$MEMORY_NUDGE_IN"
-  # Register the PostToolUse hook in settings.json. Idempotent by command
-  # path, since this patch runs on every launch and settings.json persists
-  # across them - a plain append would duplicate the entry every session.
-  python3 - "$CONFIG_DIR/settings.json" "$MEMORY_NUDGE_IN" <<'EOF'
+  # Hook scripts (claude-hooks/): copied to the host-side share dir and mounted
+  # on PATH. Under bwrap they are reached at $BIN_IN/<name>; seatbelt applies no
+  # mounts, so it runs them at their host path.
+  #   memory-findings-nudge  PostToolUse(Edit|Write) - nudges the agent to also
+  #                          findings-record its own auto-memory writes
+  #   findings-hook prompt   UserPromptSubmit - auto-recall: injects the claims
+  #                          matching the prompt (closes the "never recalls" gap)
+  #   findings-hook stop     Stop - one-shot "record before you finish" nudge for
+  #                          a substantial session that recorded nothing
+  #   findings-hook compact  SessionStart(compact) - re-injects the claims shown
+  #                          before compaction + a record nudge
+  # Every script exits 0 silently unless FINDINGS_DB is set (only when this block
+  # ran), so a stale registration can never break a --no-findings run.
+  for _h in memory-findings-nudge findings-hook; do
+    cp "$SANDBOX_DIR/claude-hooks/$_h" "$LOCAL_SHARE_DIR/$_h"
+    chmod +x "$LOCAL_SHARE_DIR/$_h"
+    add_mount ro "$LOCAL_SHARE_DIR/$_h" "$BIN_IN/$_h"
+  done
+  if [ "$BACKEND" = seatbelt ]; then HOOKS_IN="$LOCAL_SHARE_DIR"; else HOOKS_IN="$BIN_IN"; fi
+fi
+
+# Register (or, with findings inactive, remove) the findings hooks in the
+# persistent settings.json. Idempotent by command string: this runs on every
+# launch and settings.json persists across them, so a plain append would
+# duplicate entries every session. Matching is on our own script names, so
+# user-added hooks on the same events are left alone.
+python3 - "$CONFIG_DIR/settings.json" "${HOOKS_IN:-}" <<'EOF'
 import json, sys
-path, cmd = sys.argv[1], sys.argv[2]
+path, hooks_in = sys.argv[1], sys.argv[2]
 with open(path) as f:
     d = json.load(f)
-post = d.setdefault('hooks', {}).setdefault('PostToolUse', [])
-already = any(
-    h.get('matcher') == 'Edit|Write'
-    and any(hh.get('command') == cmd for hh in h.get('hooks', []))
-    for h in post
-)
-if not already:
-    post.append({'matcher': 'Edit|Write', 'hooks': [{'type': 'command', 'command': cmd}]})
+OURS = ('memory-findings-nudge', 'findings-hook')
+def is_ours(h):
+    return any(('/' + n + ' ') in h.get('command', '') + ' ' for n in OURS)
+hooks = d.setdefault('hooks', {})
+# strip every previous registration of ours, then re-add the current set
+for ev in list(hooks):
+    kept = []
+    for grp in hooks[ev]:
+        rest = [h for h in grp.get('hooks', []) if not is_ours(h)]
+        if rest:
+            grp['hooks'] = rest
+            kept.append(grp)
+    if kept:
+        hooks[ev] = kept
+    else:
+        del hooks[ev]
+if hooks_in:
+    want = [
+        ('PostToolUse',      'Edit|Write', f'{hooks_in}/memory-findings-nudge', None),
+        ('UserPromptSubmit', None,         f'{hooks_in}/findings-hook prompt',  20),
+        ('Stop',             None,         f'{hooks_in}/findings-hook stop',    15),
+        ('SessionStart',     'compact',    f'{hooks_in}/findings-hook compact', 15),
+    ]
+    for ev, matcher, cmd, timeout in want:
+        h = {'type': 'command', 'command': cmd}
+        if timeout:
+            h['timeout'] = timeout
+        grp = {'hooks': [h]}
+        if matcher:
+            grp['matcher'] = matcher
+        hooks.setdefault(ev, []).append(grp)
+if not hooks:
+    del d['hooks']
 with open(path, 'w') as f:
     json.dump(d, f, indent=2)
 EOF
-fi
 
 # --- secret scrubbing -------------------------------------------------
 # Shadow known secret-shaped files under the mounted root with an empty
@@ -669,9 +687,7 @@ else
   # that with a system-prompt directive, so the agent edits the checked-out tree
   # directly - use it when you want its work to land on your working tree.
   CLAUDE_ENV=(IS_SANDBOX=1 "DISABLE_AUTOUPDATER=1")
-  [ -n "$CSANDBOX_SUMMARY" ] && CLAUDE_ENV+=("CSANDBOX_SUMMARY=$CSANDBOX_SUMMARY")
   [ -n "$CSANDBOX_MANIFEST" ] && CLAUDE_ENV+=("CSANDBOX_MANIFEST=$CSANDBOX_MANIFEST")
-  [ -n "$CSANDBOX_COMMENTS" ] && CLAUDE_ENV+=("CSANDBOX_COMMENTS=$CSANDBOX_COMMENTS")
   CLAUDE_ENV+=("CSANDBOX_SCRATCH=$SCRATCH_IN")
   # bwrap injects CLAUDE_CONFIG_DIR via --setenv at launch; the seatbelt backend
   # runs claude with the plain env, so it must be set here or claude reads the
@@ -684,7 +700,7 @@ else
   [ ${#MINT_SESSION_ARGS[@]} -gt 0 ] && CLAUDE_ARGS+=("${MINT_SESSION_ARGS[@]}")
   if [ "$LIVE" = 1 ]; then
     CLAUDE_ENV+=(CSANDBOX_LIVE=1)
-    CLAUDE_ARGS+=(--append-system-prompt "This session was launched with csandbox --live: work DIRECTLY in the checked-out working tree on its CURRENT branch, for the whole session. Do NOT create or switch to another branch or git worktree by ANY means - not EnterWorktree, not csbox-enter-repo, and not raw git (git worktree add / git checkout -b / git switch -c) - not at startup, not mid-session, and not to package a deliverable, review, or fix. If you commit, commit on the current branch. The user has deliberately chosen to work live on their current tree; this OVERRIDES all branch/worktree guidance in CLAUDE.md (the Top-level session worktree block, Crossing repos, and any review guidance).")
+    CLAUDE_ARGS+=(--append-system-prompt "This session was launched with csandbox --live: work DIRECTLY in the checked-out working tree on its CURRENT branch, for the whole session. Do NOT create or switch to another branch or git worktree by ANY means - not EnterWorktree, not csbox-enter-repo, and not raw git (git worktree add / git checkout -b / git switch -c) - not at startup, not mid-session, and not to package a deliverable, review, or fix. If you commit, commit on the current branch. The user has deliberately chosen to work live on their current tree; this OVERRIDES all branch/worktree guidance in CLAUDE.md (the Top-level session worktree block and Crossing repos).")
   fi
   if [ -n "$FINDINGS_DIR" ]; then
     CLAUDE_ENV+=("FINDINGS_DB=$HOME_IN/.findings/findings.db" "FINDINGS_EVENTS=$FINDINGS_EVENTS")
@@ -882,42 +898,6 @@ PY
   set -e
 }
 
-# Mark the session RUNNING in the tasks db up front (host-side; the sandbox
-# can't reach the db). The review app uses this to show live sessions and to
-# refuse a merge/destroy on one. The post-run recorder flips it to ready/
-# summary_only on exit; a row stuck at 'running' means the sandbox was killed
-# hard. Skipped for shell mode and picker runs (no id yet).
-if [ -n "$SESSION_ID" ] && [ "${CSANDBOX_SHELL:-}" != "1" ]; then
-  python3 - "$TASKS_DB" "$SESSION_ID" "$PROJECT_DIR" "$NAME" "$SCRATCH_DIR" <<'PY' 2>/dev/null || true
-import os, sqlite3, sys, time
-db, sid, pdir, name, scratch = sys.argv[1:6]
-adir = os.path.join(scratch, 'sessions', sid)
-adir = adir if os.path.isdir(adir) else ''
-now = int(time.time())
-con = sqlite3.connect(db, timeout=10)
-try:
-    con.execute('PRAGMA busy_timeout=5000')
-    con.execute('''CREATE TABLE IF NOT EXISTS sessions (
-        session_id TEXT PRIMARY KEY, name TEXT, dir TEXT, branch TEXT, base_sha TEXT,
-        head_sha TEXT, status TEXT, summary_path TEXT, artifacts_dir TEXT,
-        created_at INTEGER, updated_at INTEGER)''')
-    cols = [r[1] for r in con.execute('PRAGMA table_info(sessions)')]
-    for c in ('summary_path', 'name', 'artifacts_dir'):
-        if c not in cols:
-            con.execute('ALTER TABLE sessions ADD COLUMN %s TEXT' % c)
-    con.execute('''INSERT INTO sessions
-          (session_id, name, dir, status, artifacts_dir, created_at, updated_at)
-        VALUES (?,?,?,?,?,?,?)
-        ON CONFLICT(session_id) DO UPDATE SET
-          status='running', dir=excluded.dir, artifacts_dir=excluded.artifacts_dir,
-          name=COALESCE(excluded.name, sessions.name), updated_at=excluded.updated_at''',
-        (sid, name or None, pdir, 'running', adir or None, now, now))
-    con.commit()
-finally:
-    con.close()
-PY
-fi
-
 case "$BACKEND" in
   bwrap)    launch_bwrap ;;
   seatbelt) launch_seatbelt ;;
@@ -926,163 +906,6 @@ esac
 if [ -n "$BLOCKED" ]; then
   echo "csandbox: blocked egress this session -> $BLOCKED"
   echo "csandbox: to allow, re-run with CSANDBOX_EXTRA_DOMAINS=$BLOCKED (or a profile)"
-fi
-
-# --- record this run in the tasks db (host-side) -------------------------
-# One row per run for the review UI. Written on the host, not in the sandbox,
-# so concurrent sandboxes are just ordinary multi-process SQLite on a local fs
-# (busy_timeout absorbs the rare collision). Best-effort: never fail the launch
-# over recording. The session's working dir is read from the session file's
-# gitBranch transitions in the session log (robust vs decoding the projects/
-# folder name), computed on the main checkout so they survive worktree cleanup.
-# Also records the summary artifact path and a coarse review status.
-if [ "${CSANDBOX_SHELL:-}" != "1" ]; then
-  python3 - "$TASKS_DB" "$SESSION_ID" "$PROJECT_DIR" "$CONFIG_DIR/projects" "$SCRATCH_DIR" "$NAME" <<'PY' || true
-import glob, json, os, sqlite3, subprocess, sys, time
-
-db, session_id, project_dir, projects_dir, scratch_dir, name = sys.argv[1:7]
-
-def session_file(sid):
-    if sid:
-        hits = glob.glob(os.path.join(projects_dir, '*', sid + '.jsonl'))
-        return hits[0] if hits else None
-    files = glob.glob(os.path.join(projects_dir, '*', '*.jsonl'))
-    return max(files, key=os.path.getmtime) if files else None
-
-f = session_file(session_id)
-if not f:
-    sys.exit(0)                       # nothing ran / not found - skip quietly
-if not session_id:
-    session_id = os.path.basename(f)[:-len('.jsonl')]
-
-# Collect cwd + gitBranch transitions. The session starts in the launch dir on
-# the base branch, then EnterWorktree moves it into a worktree on a new branch,
-# so the LAST values are the ones that matter (first cwd/branch are just the
-# launch state). A trailing ExitWorktree may revert them, but the branch object
-# persists, so we diff by branch name on the main checkout below.
-cwds = []; branches = []
-try:
-    with open(f, encoding='utf-8') as fh:
-        for line in fh:
-            try:
-                rec = json.loads(line)
-            except Exception:
-                continue
-            if not isinstance(rec, dict):
-                continue
-            c = rec.get('cwd'); b = rec.get('gitBranch')
-            if c and (not cwds or cwds[-1] != c): cwds.append(c)
-            if b and (not branches or branches[-1] != b): branches.append(b)
-except Exception:
-    pass
-
-def git(d, *a):
-    try:
-        return subprocess.check_output(['git', '-C', d, *a],
-                                       stderr=subprocess.DEVNULL).decode().strip()
-    except Exception:
-        return ''
-
-resume_dir  = cwds[-1] if cwds else project_dir       # session home (for --resume)
-base_branch = branches[0] if branches else ''
-# work branch = the last branch that DIFFERS from the base. The agent is told to
-# ExitWorktree when done, which reverts gitBranch back to the base - so
-# branches[-1] would equal the base and hide the work done on the worktree
-# branch. (A same-branch session with commits and no worktree still looks like
-# summary_only here; recording base_sha at launch would fix that - a follow-up.)
-_work = [b for b in branches if b != base_branch]
-work_branch = _work[-1] if _work else (branches[-1] if branches else '')
-
-# Compute the reviewable branch/diff on the main checkout: branches are shared
-# across worktrees, so this works even if the worktree dir is cleaned up. A
-# session that never left the base branch (e.g. --live) has no separate branch
-# to diff - record head only, leave base empty (a working-tree review).
-branch   = work_branch or git(project_dir, 'rev-parse', '--abbrev-ref', 'HEAD')
-head_sha = git(project_dir, 'rev-parse', work_branch or 'HEAD')
-base_sha = ''
-if work_branch and base_branch and work_branch != base_branch:
-    base_sha = git(project_dir, 'merge-base', work_branch, base_branch)
-
-# summary artifact (absent if the agent wrote none, or a --continue run that had
-# no CSANDBOX_SUMMARY); recorded as the host path the review UI reads
-summary_path = os.path.join(scratch_dir, 'sessions', session_id, 'summary.md')
-if not os.path.exists(summary_path):
-    summary_path = ''
-
-# The post-checkout hook records each worktree's exact fork point in the
-# manifest; prefer it for the work branch's base - more accurate than merge-base,
-# and the foundation for the subagent tree (later steps read the whole manifest).
-manifest = os.path.join(scratch_dir, 'sessions', session_id, 'worktrees.jsonl')
-if work_branch and os.path.exists(manifest):
-    try:
-        with open(manifest, encoding='utf-8') as fh:
-            for line in fh:
-                try:
-                    e = json.loads(line)
-                except Exception:
-                    continue
-                if isinstance(e, dict) and e.get('branch') == work_branch and e.get('fork_sha'):
-                    base_sha = e['fork_sha']
-    except Exception:
-        pass
-
-# coarse review status: a diff to review, or none. 'blocked' is reserved for the
-# transcript prompt-scan follow-up (a session that stalled on a permission wall).
-status = 'ready' if base_sha else 'summary_only'
-
-# the session's scratch dir - where csreview finds this session's per-worktree
-# manifest (worktrees.jsonl -> the subagent branches to review) and the review
-# comment log (comments.jsonl). One pointer; the rest are siblings.
-artifacts_dir = os.path.join(scratch_dir, 'sessions', session_id)
-if not os.path.isdir(artifacts_dir):
-    artifacts_dir = ''
-
-# display label: the --name if given, else the branch slug (already semi-readable)
-if not name:
-    name = branch[len('worktree-'):] if branch.startswith('worktree-') else (branch or session_id[:8])
-
-now = int(time.time())
-con = sqlite3.connect(db, timeout=10)
-try:
-    con.execute('PRAGMA busy_timeout=5000')
-    con.execute('''CREATE TABLE IF NOT EXISTS sessions (
-        session_id   TEXT PRIMARY KEY,
-        name         TEXT,
-        dir          TEXT,
-        branch       TEXT,
-        base_sha     TEXT,
-        head_sha     TEXT,
-        status        TEXT,
-        summary_path  TEXT,
-        artifacts_dir TEXT,
-        created_at    INTEGER,
-        updated_at    INTEGER
-    )''')
-    # migrate dbs created before these columns existed
-    cols = [r[1] for r in con.execute('PRAGMA table_info(sessions)')]
-    if 'summary_path' not in cols:
-        con.execute('ALTER TABLE sessions ADD COLUMN summary_path TEXT')
-    if 'name' not in cols:
-        con.execute('ALTER TABLE sessions ADD COLUMN name TEXT')
-    if 'artifacts_dir' not in cols:
-        con.execute('ALTER TABLE sessions ADD COLUMN artifacts_dir TEXT')
-    con.execute('''INSERT INTO sessions
-          (session_id, name, dir, branch, base_sha, head_sha, status, summary_path,
-           artifacts_dir, created_at, updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)
-        ON CONFLICT(session_id) DO UPDATE SET
-          name=excluded.name, dir=excluded.dir, branch=excluded.branch,
-          base_sha=excluded.base_sha, head_sha=excluded.head_sha,
-          status=excluded.status, summary_path=excluded.summary_path,
-          artifacts_dir=excluded.artifacts_dir, updated_at=excluded.updated_at''',
-        (session_id, name, resume_dir, branch, base_sha, head_sha, status,
-         summary_path, artifacts_dir, now, now))
-    con.commit()
-finally:
-    con.close()
-sys.stderr.write("csandbox: recorded session %s (branch=%s, status=%s) in tasks db\n"
-                 % (session_id[:8], branch or '-', status))
-PY
 fi
 
 exit $RC

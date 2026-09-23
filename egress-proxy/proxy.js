@@ -59,6 +59,15 @@ server.on('connect', (req, clientSocket, head) => {
   const [host, portStr] = req.url.split(':');
   const port = parseInt(portStr, 10) || 443;
 
+  // Attached unconditionally, before any branch: once Node hands us a
+  // CONNECT-hijacked socket it removes its own internal error handling, so
+  // a reset on the DENIED path (e.g. the client aborting right after the
+  // 403) has nowhere to go and crashes the whole process (an 'error' event
+  // with no listener is fatal by default) - this is what previously took
+  // the proxy down.
+  let upstream = null;
+  clientSocket.on('error', () => { if (upstream) upstream.destroy(); });
+
   if (!isAllowed(host)) {
     log('DENY', host, port);
     clientSocket.end('HTTP/1.1 403 Forbidden\r\n\r\n');
@@ -73,7 +82,7 @@ server.on('connect', (req, clientSocket, head) => {
   // under the ~5min idle timeout common on home/corporate NAT and cloud NAT
   // gateways.
   clientSocket.setKeepAlive(true, 30_000);
-  const upstream = net.connect(port, host, () => {
+  upstream = net.connect(port, host, () => {
     upstream.setKeepAlive(true, 30_000);
     clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
     upstream.write(head);
@@ -81,7 +90,6 @@ server.on('connect', (req, clientSocket, head) => {
     clientSocket.pipe(upstream);
   });
   upstream.on('error', () => clientSocket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n'));
-  clientSocket.on('error', () => upstream.destroy());
 });
 
 server.listen(PORT, () => {

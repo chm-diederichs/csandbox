@@ -139,6 +139,9 @@ claude-sandbox/
 ├── git-hooks/
 │   ├── post-checkout   # fires on `git worktree add`; auto-hydrates node_modules
 │   └── wt-hydrate      # clones node_modules from the main worktree (CoW), offline
+├── claude-hooks/        # Claude Code lifecycle hooks, mounted + registered per launch
+│   ├── findings-hook          # prompt: auto-recall · stop: record nudge · compact: re-inject
+│   └── memory-findings-nudge  # PostToolUse: mirror auto-memory writes into findings
 └── egress-proxy/
     └── proxy.js         # allowlist-enforcing forward proxy (no deps), run directly by bwrap
 ```
@@ -221,6 +224,26 @@ This is best-effort — if `linker` isn't on the host `PATH`, the sandbox just
 skips it (no links wired). The agent is told it's automatic via a seeded
 "Linked local dependencies" `CLAUDE.md` section (only added when linker is
 active).
+
+## Findings memory
+
+On by default (`--no-findings` / `CSANDBOX_FINDINGS=0` to opt out) when the
+[`findings`](../../dev/findings) tool is present on the host: a shared,
+queryable SQLite store of distilled claims (`observation` / `decision` /
+`memory`) that lets sessions stay short and ephemeral instead of carrying one
+long, lossily-compacted transcript. Like linker it is mounted, not baked: the
+CLI at `/opt/findings`, a wrapper on `PATH`, and `~/.findings` read-write so
+every session reads and writes one store. Findings are keyed by repo (the main
+worktree, however many linked worktrees recorded them), and observations flag
+"verify" when their files changed since they were recorded.
+
+Three hooks (`claude-hooks/findings-hook`) make it work without relying on the
+agent remembering to: `UserPromptSubmit` recalls the prompt's terms and injects
+the matching claims as reference-only context; `Stop` nudges once if a
+substantial session recorded nothing; `SessionStart(compact)` re-injects what
+was shown before compaction. Every command is traced to `~/.findings/events.jsonl`
+(`findings stats`) so recall miss-rate is measurable. Design and observed
+numbers: `docs/findings-memory.md`.
 
 ---
 
