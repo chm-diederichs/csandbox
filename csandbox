@@ -56,7 +56,7 @@
 #   CSANDBOX_ROOT=~/src csandbox .               # custom workspace root
 #   CSANDBOX_READONLY=1 csandbox .               # mount workspace read-only
 #   CSANDBOX_SHELL=1 csandbox .                  # drop into bash, not claude
-#   csandbox --live .                            # edit the working tree directly (no worktree)
+#   csandbox --worktree .                        # agent works on a disposable branch/worktree (default: edits the tree directly)
 #   CSANDBOX_DRYRUN=1 csandbox .                 # print resolved config & exit
 #   CSANDBOX_DOWN=1 csandbox                     # stop the egress proxy & exit
 
@@ -164,14 +164,16 @@ MOUNT_MODE=(); MOUNT_SRC=(); MOUNT_DST=()
 add_mount() { MOUNT_MODE+=("$1"); MOUNT_SRC+=("$2"); MOUNT_DST+=("$3"); }  # add_mount <ro|rw> <src> <dst>
 
 # pull csandbox's own flags out of the arg list; everything else goes to claude
-LIVE=0
+LIVE=1                                 # default: agent edits the checked-out tree; --worktree / CSANDBOX_WORKTREE=1 for a disposable session worktree
+[ "${CSANDBOX_WORKTREE:-0}" = 1 ] && LIVE=0
 FINDINGS="${CSANDBOX_FINDINGS:-1}"   # external memory: on by default; --no-findings / CSANDBOX_FINDINGS=0 disables
 FINDINGS_EXPLICIT=0                    # set by --findings; warn only then if the tool is missing
 EDIT_GATE="${CSANDBOX_EDIT_GATE:-1}"   # PreToolUse fact-forcing gate on first edits (claude-hooks/edit-gate); 0 disables
 ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --live) LIVE=1; shift ;;
+    --live) LIVE=1; shift ;;                                # the default; kept for muscle memory
+    --worktree) LIVE=0; shift ;;                            # opt in to the top-level session worktree
     --findings) FINDINGS=1; FINDINGS_EXPLICIT=1; shift ;;   # explicit on (already the default)
     --no-findings) FINDINGS=0; shift ;;                     # opt out of the findings memory
     *)      ARGS+=("$1"); shift ;;
@@ -322,31 +324,51 @@ fi
 # existed gets the fix appended too - at the cost of a duplicate heading on
 # that one host, which is a fine trade given what skipping the check cost
 # (see below).
-if ! grep -q 'ALREADY in one' "$CONFIG_DIR/CLAUDE.md" 2>/dev/null; then
+# Sections whose text has changed since an earlier seeding: drop the stale
+# version (identified by a phrase only the old text had) so the guards below
+# re-append the current one. A section runs from its "# heading" to the next
+# "# " line.
+python3 - "$CONFIG_DIR/CLAUDE.md" <<'PY'
+import re, sys
+p = sys.argv[1]
+try:
+    s = open(p).read()
+except FileNotFoundError:
+    sys.exit()
+def drop(s, heading, stale):
+    m = re.search(r'(?ms)^# ' + re.escape(heading) + r'\n.*?(?=^# |\Z)', s)
+    if m and stale in m.group(0):
+        s = s[:m.start()].rstrip('\n') + '\n' + s[m.end():]
+    return s
+s = drop(s, 'Top-level session worktree', 'at the start of every session in a git repo, call `EnterWorktree`')
+s = drop(s, 'Parallel worktree subagents', "nested under the\ntop-level session's own worktree")
+s = drop(s, 'Session output', 'COMMIT your work on the worktree branch before finishing')
+open(p, 'w').write(s)
+PY
+if ! grep -q 'launched with `csandbox --worktree`' "$CONFIG_DIR/CLAUDE.md" 2>/dev/null; then
   cat >> "$CONFIG_DIR/CLAUDE.md" <<'EOF'
 
 # Top-level session worktree
-Before calling `EnterWorktree`, check whether you're ALREADY in one: if your
-current directory's path contains `/.claude/worktrees/`, you're already
-inside a worktree from a previous or resumed session - do NOT call
-EnterWorktree again, just work where you are. This matters because
-EnterWorktree only refuses a second call within the SAME session; a fresh
-session that happens to launch or resume into an already-nested worktree has
-no such guard, and calling it anyway nests a new worktree one level deeper -
-repeat that across enough sessions and you get worktrees dozens of levels
-deep, each hydrating its own full node_modules copy (this happened - 267GB
-across two repos before it was caught).
+DEFAULT: work DIRECTLY in the checked-out working tree, on its current
+branch, for the whole session. Do not call `EnterWorktree`, do not run
+`csbox-enter-repo` for the repo you are already in, and do not create
+branches or worktrees with raw git - unless the user asks for one in the
+conversation, or the session was launched with `csandbox --worktree` (the
+system prompt says so explicitly when it was).
 
-Otherwise, at the start of every session in a git repo, call `EnterWorktree`
-before touching any files, so my own edits land on a disposable branch
-instead of the user's checked-out working tree - the user is often hacking
-there concurrently and needs it left alone. `worktree.baseRef` is set to
-`head`, so the worktree branches from the current commit (not
-origin/default) - but note this only carries committed history, not the
-user's uncommitted/staged changes, since worktrees can't share those. When
-the work is done, leave the branch as-is (`ExitWorktree` with `action:
-"keep"`) and tell the user it's ready to review and merge manually - don't
-push, open a PR, or merge it myself unless asked.
+WITH --worktree: first check whether you're ALREADY in one - if your current
+directory's path contains `/.claude/worktrees/`, work where you are; calling
+EnterWorktree again nests a worktree one level deeper, and repeated across
+sessions that once produced 267GB of nested node_modules. Otherwise call
+`EnterWorktree` before touching any files, so edits land on a disposable
+branch off the current commit (`worktree.baseRef: head`; committed history
+only, not the user's uncommitted changes). When done, leave the branch
+(`ExitWorktree` with `action: "keep"`) for the user to review and merge -
+don't push, open a PR, or merge it yourself unless asked.
+
+Any worktree you DO create by hand (e.g. "check out branch X in a worktree")
+goes under `<repo>/.claude/worktrees/<name>` - never as a sibling directory of
+the repo, which scatters checkouts across the workspace.
 EOF
 fi
 if ! grep -q 'should NOT ALSO call' "$CONFIG_DIR/CLAUDE.md" 2>/dev/null; then
@@ -354,28 +376,26 @@ if ! grep -q 'should NOT ALSO call' "$CONFIG_DIR/CLAUDE.md" 2>/dev/null; then
 
 # Parallel worktree subagents
 When a task parallelizes, fan out with `Agent(isolation: "worktree")` - each
-subagent gets its own worktree, all in this one sandbox, nested under the
-top-level session's own worktree. That isolation ALREADY puts the subagent's
-cwd under `.claude/worktrees/...` before it starts - a subagent finding
-itself there should NOT ALSO call `EnterWorktree` (see the "Top-level
-session worktree" note above on checking first); doing so nests yet another,
-unnecessary worktree layer, and if that subagent itself fans out further
-subagents that make the same mistake, depth compounds fast. node_modules is
-hydrated automatically when the worktree is created, so don't run `npm
-install` or treat the worktree as having no deps. Keep the parallel phase
-network-quiet: adding a NEW dependency needs the npm registry and will trip
-the egress gate, so do dependency changes before/after fanning out, not
-during. Use the directory named in `$CSANDBOX_SCRATCH` for handoffs between
-agents.
+subagent gets its own worktree under the repo's `.claude/worktrees/`, all in
+this one sandbox. That isolation ALREADY puts the subagent's cwd under
+`.claude/worktrees/...` before it starts - a subagent finding itself there
+should NOT ALSO call `EnterWorktree`; doing so nests yet another, unnecessary
+worktree layer, and if that subagent itself fans out further subagents that
+make the same mistake, depth compounds fast. node_modules is hydrated
+automatically when the worktree is created, so don't run `npm install` or
+treat the worktree as having no deps. Keep the parallel phase network-quiet:
+adding a NEW dependency needs the npm registry and will trip the egress gate,
+so do dependency changes before/after fanning out, not during. Use the
+directory named in `$CSANDBOX_SCRATCH` for handoffs between agents.
 EOF
 fi
 if ! grep -q 'Session output' "$CONFIG_DIR/CLAUDE.md" 2>/dev/null; then
   cat >> "$CONFIG_DIR/CLAUDE.md" <<'EOF'
 
 # Session output
-COMMIT your work on the worktree branch before finishing - a commit is what
-creates a reviewable diff; uncommitted changes are invisible to anyone
-reviewing the branch later.
+COMMIT your work before finishing - on the current branch by default, on the
+session worktree's branch under --worktree. A commit is what creates a
+reviewable diff; uncommitted changes are invisible to anyone reviewing later.
 EOF
 fi
 if ! grep -q 'own collection' "$CONFIG_DIR/CLAUDE.md" 2>/dev/null; then
@@ -753,10 +773,10 @@ fi
 if [ "${CSANDBOX_SHELL:-}" = "1" ]; then
   CMD=(bash)
 else
-  # By default the agent enters a disposable worktree at session start (see the
-  # "Top-level session worktree" block in the seeded CLAUDE.md). --live overrides
-  # that with a system-prompt directive, so the agent edits the checked-out tree
-  # directly - use it when you want its work to land on your working tree.
+  # Default: the agent edits the checked-out tree directly (the seeded
+  # "Top-level session worktree" block in CLAUDE.md says so). --worktree /
+  # CSANDBOX_WORKTREE=1 flips it: a system-prompt directive tells the agent to
+  # EnterWorktree at start and leave the branch for review.
   CLAUDE_ENV=(IS_SANDBOX=1 "DISABLE_AUTOUPDATER=1")
   [ -n "$CSANDBOX_MANIFEST" ] && CLAUDE_ENV+=("CSANDBOX_MANIFEST=$CSANDBOX_MANIFEST")
   CLAUDE_ENV+=("CSANDBOX_SCRATCH=$SCRATCH_IN")
@@ -773,8 +793,10 @@ else
   CLAUDE_ARGS=(--dangerously-skip-permissions)
   [ ${#MINT_SESSION_ARGS[@]} -gt 0 ] && CLAUDE_ARGS+=("${MINT_SESSION_ARGS[@]}")
   if [ "$LIVE" = 1 ]; then
-    CLAUDE_ENV+=(CSANDBOX_LIVE=1)
-    CLAUDE_ARGS+=(--append-system-prompt "This session was launched with csandbox --live: work DIRECTLY in the checked-out working tree on its CURRENT branch, for the whole session. Do NOT create or switch to another branch or git worktree by ANY means - not EnterWorktree, not csbox-enter-repo, and not raw git (git worktree add / git checkout -b / git switch -c) - not at startup, not mid-session, and not to package a deliverable, review, or fix. If you commit, commit on the current branch. The user has deliberately chosen to work live on their current tree; this OVERRIDES all branch/worktree guidance in CLAUDE.md (the Top-level session worktree block and Crossing repos).")
+    CLAUDE_ENV+=(CSANDBOX_LIVE=1)   # default; the seeded CLAUDE.md already says "work in the tree"
+  else
+    CLAUDE_ENV+=(CSANDBOX_WORKTREE=1)
+    CLAUDE_ARGS+=(--append-system-prompt "This session was launched with csandbox --worktree: follow the WITH --worktree path of the 'Top-level session worktree' section in CLAUDE.md - check you are not already inside a .claude/worktrees path, otherwise call EnterWorktree before touching files, work on that disposable branch for the whole session, and leave it for the user to review (no push/PR/merge).")
   fi
   if [ -n "$FINDINGS_DIR" ]; then
     CLAUDE_ENV+=("FINDINGS_DB=$HOME_IN/.findings/findings.db" "FINDINGS_EVENTS=$FINDINGS_EVENTS")
@@ -800,7 +822,7 @@ echo "csandbox: mount $ROOT ($MOUNT_NOTE), $SCRUB_COUNT secret file(s) shadowed"
 echo "csandbox: egress allowlist -> $ALLOWED_DOMAINS"
 [ -n "$LINKER_DIR" ] && echo "csandbox: linker -> $LINKER_DIR (declarative local links wired per-worktree)"
 [ -n "$FINDINGS_DIR" ] && echo "csandbox: findings -> $FINDINGS_DIR (external memory at ~/.findings, telemetry on; --no-findings to disable)"
-[ "$LIVE" = 1 ] && echo "csandbox: --live -> agent edits the working tree directly (no top-level worktree)"
+if [ "$LIVE" = 1 ]; then echo "csandbox: agent edits the working tree directly (--worktree for a disposable session branch)"; else echo "csandbox: --worktree -> agent works on a disposable session worktree"; fi
 
 # dry run: show resolved config and stop before launching the backend
 if [ "${CSANDBOX_DRYRUN:-}" = "1" ]; then

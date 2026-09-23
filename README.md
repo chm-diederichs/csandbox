@@ -24,7 +24,7 @@ no daemon, no image, no build step.
 csandbox                       # sandbox the current directory (minimal egress)
 csandbox ~/code/myapp          # sandbox a specific project
 csandbox . --continue          # trailing args are passed to `claude`
-csandbox --live .              # edit your working tree directly (see below)
+csandbox --worktree .          # agent works on a disposable branch instead of your tree (see below)
 CSANDBOX_PROFILE=dev csandbox . # allow npm + git + pypi for this session
 ```
 
@@ -126,6 +126,7 @@ profiles trade some of that for convenience.
 | `CSANDBOX_SHELL=1`       | Drop into `bash` inside the sandbox instead of launching `claude`.                       |
 | `CSANDBOX_DRYRUN=1`      | Print the resolved config (mounts, allowlist) and exit without launching.               |
 | `CSANDBOX_DOWN=1`        | Stop the egress proxy, then exit.                                                        |
+| `CSANDBOX_WORKTREE=1`    | Agent works on a disposable session worktree instead of your tree (`--worktree` does the same). |
 | `CSANDBOX_EDIT_GATE=0`   | Disable the edit gate hook (first edit to an existing source file is otherwise blocked once with a fact request). |
 | `CSANDBOX_FINDINGS=0`    | Disable the findings memory for this run (`--no-findings` does the same).                |
 
@@ -170,21 +171,23 @@ Code's hardcoded self-config approval prompt (it survives even
 
 ## Top-level session worktree
 
-By default, the seeded `CLAUDE.md` tells the agent to `EnterWorktree` at the
-start of every session in a git repo, so its edits land on a **disposable
-branch off the current commit** (`worktree.baseRef: "head"`) rather than on your
-checked-out tree — you're often hacking in the same repo concurrently and want it
-left alone. When the agent finishes it keeps the branch and leaves it for you to
-review and merge manually (it won't push, PR, or merge on its own). Note the
-worktree carries committed history only, not your uncommitted/staged changes.
+By default the agent works **directly in your checked-out tree, on the current
+branch**, and commits there when done. The seeded `CLAUDE.md` tells it not to
+create branches or worktrees unless you ask for one in the conversation.
 
-Pass **`--live`** to opt out: the agent then edits your working tree directly.
-This is a launcher-side system-prompt override, so it works regardless of what's
-in the seeded `CLAUDE.md`.
+Pass **`--worktree`** (or `CSANDBOX_WORKTREE=1`) when you are hacking in the
+same repo concurrently and want the agent's edits kept off your tree: it then
+calls `EnterWorktree` at session start, so its work lands on a disposable branch
+off the current commit (`worktree.baseRef: "head"`), and it leaves that branch
+for you to review and merge (it won't push, PR, or merge). A worktree carries
+committed history only, not your uncommitted changes.
+
+Either way, any worktree the agent creates by hand goes under
+`<repo>/.claude/worktrees/<name>`, never as a sibling directory of the repo.
 
 ```bash
-csandbox .          # default: agent works on its own throwaway branch
-csandbox --live .   # agent edits your checked-out working tree
+csandbox .              # default: agent edits your checked-out working tree
+csandbox --worktree .   # agent works on its own throwaway branch
 ```
 
 ---
