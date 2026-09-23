@@ -6,8 +6,10 @@ Asking an agent "did you check the callers?" always gets "yes". Asking it to
 *list every importer* forces a grep, and the grep is what creates the context
 that prevents the change-one-repo-break-three-others failure this poly-repo
 is prone to. So the first Edit/Write to an existing .js/.mjs/.cjs/.ts file
-outside test/bench dirs is blocked once (exit 2 -> stderr is shown to the
-agent as the reason) with the list of facts to establish; the retry passes.
+outside test/bench dirs is denied once (a structured PreToolUse deny whose
+reason is shown to the agent) with the facts to establish - including the grep
+that actually finds importers, by package name for an entry point and by
+relative path for an internal file; the retry passes.
 One block per file per session; state lives under $CSANDBOX_HOOK_STATE.
 
 Opt out with CSANDBOX_EDIT_GATE=0. Best-effort: any failure exits 0.
@@ -22,16 +24,67 @@ SRC_EXT = ('.js', '.mjs', '.cjs', '.ts')
 SKIP_DIRS = re.compile(r'/(test|tests|bench|benchmarks|node_modules|\.claude|scratch|docs|examples|fixtures)/')
 SKIP_NAME = re.compile(r'(\.test\.|\.spec\.|^bench|^test)')
 
-MSG = """edit gate (fires once per file per session): this is the first edit to an existing source file, {rel}.
-Repos in this workspace import each other, so before retrying, establish these facts and state them in your reply:
-  1. Every file that imports/requires this module - search the whole workspace, not just this repo:
-       grep -rln --include='*.js' --include='*.mjs' --include='*.cjs' --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.claude "{stem}" {root}
+MSG = """edit gate (once per file per session): first edit to an existing source file, {rel}.
+Repos in this workspace import each other. Before retrying, establish and state these facts:
+  1. Who imports it.
+{importers}
   2. Which exported functions/classes the change touches, and whether their signature, return shape,
      or event/error behavior changes for those importers.
   3. If this file reads or writes a persisted or wire format (encodings, storage layout, protocol
      messages): the field names and the version/compat handling involved.
   4. The user's instruction you are acting on, quoted.
-Then re-issue the edit; the gate will not fire again for this file."""
+Then re-issue the same edit; the gate will not fire again for this file."""
+
+EXCL = "--exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.claude"
+
+def repo_root(path):
+    try:
+        r = subprocess.run(['git', '-C', os.path.dirname(path), 'rev-parse', '--show-toplevel'],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except Exception:
+        pass
+    d = os.path.dirname(path)
+    while d and d != '/':
+        if os.path.exists(os.path.join(d, 'package.json')):
+            return d
+        d = os.path.dirname(d)
+    return None
+
+def package_info(root):
+    """(name, set of entry files) from package.json - main + string/object exports."""
+    try:
+        with open(os.path.join(root, 'package.json')) as f:
+            pkg = json.load(f)
+    except Exception:
+        return None, set()
+    entries = set()
+    def add(v):
+        if isinstance(v, str) and v.endswith(SRC_EXT):
+            entries.add(os.path.normpath(os.path.join(root, v)))
+        elif isinstance(v, dict):
+            for x in v.values(): add(x)
+    add(pkg.get('main') or 'index.js')
+    add(pkg.get('exports'))
+    return pkg.get('name'), entries
+
+def importer_hint(path, root, workspace):
+    """The grep(s) that actually find importers, by how this file is reachable."""
+    if not root:
+        stem = os.path.splitext(os.path.basename(path))[0]
+        return f"       grep -rln --include='*.js' --include='*.mjs' --include='*.cjs' {EXCL} \"{stem}\" {workspace}"
+    name, entries = package_info(root)
+    rel = os.path.relpath(path, root)
+    rel_noext = os.path.splitext(rel)[0]
+    lines = []
+    if name and os.path.normpath(path) in entries:
+        lines.append(f"     This is an entry point of package '{name}', so importers are OTHER repos - search the workspace for the package name:")
+        lines.append(f"       grep -rln --include='*.js' --include='*.mjs' --include='*.cjs' {EXCL} -e \"require('{name}\" -e \"from '{name}\" {workspace}")
+    else:
+        lines.append(f"     Internal file - importers are in this repo (other repos can only reach it via package.json exports; check that too):")
+        lines.append(f"       grep -rn --include='*.js' --include='*.mjs' --include='*.cjs' {EXCL} -e \"/{rel_noext}'\" -e \"/{os.path.basename(rel_noext)}'\" {root}")
+    return '\n'.join(lines)
 
 def main():
     if os.environ.get('CSANDBOX_EDIT_GATE', '1') == '0':
@@ -55,12 +108,17 @@ def main():
         return
     with open(marker, 'w') as f:
         f.write(path + '\n')
-    root = os.environ.get('CSANDBOX_ROOT') or os.path.expanduser('~/hyper')
+    workspace = os.environ.get('CSANDBOX_ROOT') or os.path.expanduser('~/hyper')
     cwd = d.get('cwd') or os.getcwd()
     rel = os.path.relpath(path, cwd) if path.startswith(cwd) else path
-    stem = os.path.splitext(os.path.basename(path))[0]
-    sys.stderr.write(MSG.format(rel=rel, stem=stem, root=root) + '\n')
-    sys.exit(2)
+    reason = MSG.format(rel=rel, importers=importer_hint(path, repo_root(path), workspace))
+    # a structured deny (exit 0) is shown to the model as the reason the call was
+    # refused; exit 2 would do the same but the UI renders it as a hook *error*
+    print(json.dumps({'hookSpecificOutput': {
+        'hookEventName': 'PreToolUse',
+        'permissionDecision': 'deny',
+        'permissionDecisionReason': reason,
+    }}))
 
 if __name__ == '__main__':
     try:
