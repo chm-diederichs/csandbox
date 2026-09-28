@@ -55,7 +55,13 @@ if [ -z "${SUDO_USER:-}" ]; then
   exit 1
 fi
 
-PROXY_PORT="${CSANDBOX_PROXY_PORT:-8888}"
+# Loopback ports the slice may reach: one egress proxy per csandbox tenant
+# (default tenant = the first port). Recorded in /etc/csandbox/proxy-ports so
+# the launcher can allocate within the range and refuse ports outside it.
+PROXY_PORTS="${CSANDBOX_PROXY_PORTS:-8888-8899}"
+PORT_MIN="${PROXY_PORTS%-*}"; PORT_MAX="${PROXY_PORTS#*-}"
+case "$PORT_MIN$PORT_MAX" in *[!0-9]*|"") echo "bwrap-setup: CSANDBOX_PROXY_PORTS must be MIN-MAX, got '$PROXY_PORTS'" >&2; exit 1 ;; esac
+[ "$PORT_MIN" -le "$PORT_MAX" ] || { echo "bwrap-setup: CSANDBOX_PROXY_PORTS min > max ('$PROXY_PORTS')" >&2; exit 1; }
 
 command -v bwrap >/dev/null 2>&1 || { echo "bwrap-setup: bwrap (bubblewrap) is not installed - apt install bubblewrap" >&2; exit 1; }
 command -v nft >/dev/null 2>&1 || { echo "bwrap-setup: nft (nftables) is not installed - apt install nftables" >&2; exit 1; }
@@ -104,11 +110,13 @@ nft -f - <<EOF
 table inet csandbox {
   chain output {
     type filter hook output priority filter; policy accept;
-    socket cgroupv2 level ${CGROUP_LEVEL} "${CGROUP_PATH}" tcp dport ${PROXY_PORT} ip daddr 127.0.0.1 accept
+    socket cgroupv2 level ${CGROUP_LEVEL} "${CGROUP_PATH}" tcp dport ${PORT_MIN}-${PORT_MAX} ip daddr 127.0.0.1 accept
     socket cgroupv2 level ${CGROUP_LEVEL} "${CGROUP_PATH}" drop
   }
 }
 EOF
-echo "bwrap-setup: nft table 'inet csandbox' installed - csandbox.slice egress restricted to 127.0.0.1:${PROXY_PORT}"
+mkdir -p /etc/csandbox
+echo "$PORT_MIN $PORT_MAX" > /etc/csandbox/proxy-ports
+echo "bwrap-setup: nft table 'inet csandbox' installed - csandbox.slice egress restricted to 127.0.0.1:${PORT_MIN}-${PORT_MAX} (range recorded in /etc/csandbox/proxy-ports)"
 
 echo "bwrap-setup: done."

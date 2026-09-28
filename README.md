@@ -25,6 +25,7 @@ csandbox                       # sandbox the current directory (minimal egress)
 csandbox ~/code/myapp          # sandbox a specific project
 csandbox . --continue          # trailing args are passed to `claude`
 csandbox --worktree .          # agent works on a disposable branch instead of your tree (see below)
+csandbox --tenant work .       # a second Claude account: own config dir, login and proxy port (see below)
 CSANDBOX_PROFILE=dev csandbox . # allow npm + git + pypi for this session
 ```
 
@@ -126,6 +127,10 @@ profiles trade some of that for convenience.
 | `CSANDBOX_SHELL=1`       | Drop into `bash` inside the sandbox instead of launching `claude`.                       |
 | `CSANDBOX_DRYRUN=1`      | Print the resolved config (mounts, allowlist) and exit without launching.               |
 | `CSANDBOX_DOWN=1`        | Stop the egress proxy, then exit.                                                        |
+| `CSANDBOX_TENANT=<name>` | Run as a named tenant: config dir `~/.claude-sandbox-<name>`, its own login and egress proxy port (`--tenant <name>` does the same). |
+| `CSANDBOX_CONFIG_DIR`    | Explicit config dir for this run (wins over the tenant name). Set `CSANDBOX_PROXY_PORT` with it. |
+| `CSANDBOX_PROXY_PORT`    | Loopback port for this tenant's egress proxy. Default tenant: 8888; named tenants are allocated one from the range `bwrap-setup` opened. |
+| `CSANDBOX_FINDINGS_HOME` | Findings store dir (default `~/.findings`, shared by every tenant). |
 | `CSANDBOX_WORKTREE=1`    | Agent works on a disposable session worktree instead of your tree (`--worktree` does the same). |
 | `CSANDBOX_EDIT_GATE=1`   | Enable the opt-in edit gate hook: the first edit to an existing source file is refused once with a fact request (importers, exports, formats). Off by default. |
 | `CSANDBOX_FINDINGS=0`    | Disable the findings memory for this run (`--no-findings` does the same).                |
@@ -158,7 +163,10 @@ claude-sandbox/
 
 State lives outside this dir in `~/.claude-sandbox/` — the sandbox's `~/.claude`
 config dir (credentials, session history). It's created automatically; the login
-inside it is the sandbox's own (see Quick start).
+inside it is the sandbox's own (see Quick start). A named tenant gets its own
+such dir, `~/.claude-sandbox-<name>` (see [Multiple accounts](#multiple-accounts-tenants)).
+Per-user state the agent can never see lives in `~/.local/share/csandbox/`
+(wrapper scripts, hook copies, per-port proxy state).
 
 The agent also gets a persistent scratch dir: `~/.claude-sandbox/scratch` on the
 host, bind-mounted at the same path inside the sandbox (bwrap reuses real host
@@ -257,6 +265,44 @@ was shown before compaction. Every command is traced to `~/.findings/events.json
 (`findings stats`) so recall miss-rate is measurable. Design and observed
 numbers: `docs/findings-memory.md`.
 
+## Multiple accounts (tenants)
+
+A tenant is a separate Claude Code config dir, which is exactly the boundary
+Claude Code draws around an account: with `CLAUDE_CONFIG_DIR` set it keeps the
+OAuth login, the account/org ids, settings, sessions and the cached
+server-managed org policy under that dir, and under bwrap the host `~/.claude`
+is not mounted at all, so tenants can't see each other. Everything else is per
+user and shared: the workspace mount, the systemd slice and nft rule, the wrapper
+scripts, and the findings store (`CSANDBOX_FINDINGS_HOME` to split it).
+
+```bash
+csandbox --tenant work .                                  # ~/.claude-sandbox-work
+CSANDBOX_EXTRA_DOMAINS=claude.ai csandbox --tenant work . # first run: /login inside
+claude setup-token > ~/.claude-sandbox-work/oauth-token   # or: a one-year token, no login inside
+```
+
+Each tenant runs its **own egress proxy on its own loopback port**, so tenants
+with different allowlists don't restart each other's proxy: the default tenant
+uses 8888, a named tenant is allocated the next free port in the range
+`bwrap-setup` opened in the nft rule (default `8888-8899`, recorded in
+`/etc/csandbox/proxy-ports`) and remembers it in `<config>/proxy-port`.
+A setup that predates this needs one re-run: `sudo ./bwrap-setup`
+(`CSANDBOX_PROXY_PORTS=8888-8919` for more tenants). `CSANDBOX_DOWN=1 csandbox
+--tenant work` stops that tenant's proxy only.
+
+Two credentials paths: a browser `/login` inside the sandbox (refresh token
+rotates, renew about monthly for unattended use), or a one-year token from
+`claude setup-token` stored in `<config>/oauth-token` (mode 600), exported as
+`CLAUDE_CODE_OAUTH_TOKEN` for that tenant only - model requests only, no Remote
+Control or claude.ai connectors. Host-side `ANTHROPIC_API_KEY`,
+`ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_PROFILE` are
+stripped from every tenant's environment, since Claude Code ranks them above a
+stored login. Note that server-managed org policy is per account, so two
+tenants in different organizations can behave differently (e.g. bypass mode).
+
+Two tenants running concurrently in the same repo edit the same working tree by
+default; use `--worktree` for concurrent runs.
+
 ## Skills and rules
 
 Harness-level skills live in `skills/<name>/SKILL.md` and are copied into the
@@ -292,7 +338,9 @@ linker register corestore ~/hyper/corestore   # once per local dep
 ```
 
 Requires: Linux, with `bubblewrap`, `nftables`, `apparmor`, and a systemd user
-session (see `bwrap-setup`'s header for exactly why each is needed). On first
+session (see `bwrap-setup`'s header for exactly why each is needed). `bwrap-setup`
+opens loopback ports `8888-8899` for the sandbox slice (one per tenant); set
+`CSANDBOX_PROXY_PORTS=MIN-MAX` when running it to change that. On first
 launch, log the sandbox in with `CSANDBOX_EXTRA_DOMAINS=claude.ai csandbox .`
 then `/login` inside.
 
@@ -309,7 +357,7 @@ then `/login` inside.
   host `PATH` (bwrap bind-mounts the host's node/claude install read-only,
   autoupdater disabled inside the sandbox) — update it on the host as usual.
 
-- **Tear down the running proxy:** `CSANDBOX_DOWN=1 csandbox`.
+- **Tear down the running proxy:** `CSANDBOX_DOWN=1 csandbox` (add `--tenant <name>` for a tenant's).
 
 - **Re-run `bwrap-setup`:** safe any time (every step replaces its prior state);
   needed again only if the AppArmor profile, slice, or nft rule get reset

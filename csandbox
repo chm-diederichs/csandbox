@@ -57,6 +57,7 @@
 #   CSANDBOX_READONLY=1 csandbox .               # mount workspace read-only
 #   CSANDBOX_SHELL=1 csandbox .                  # drop into bash, not claude
 #   csandbox --worktree .                        # agent works on a disposable branch/worktree (default: edits the tree directly)
+#   csandbox --tenant work .                     # a second Claude account: own config dir, login, proxy port
 #   CSANDBOX_DRYRUN=1 csandbox .                 # print resolved config & exit
 #   CSANDBOX_DOWN=1 csandbox                     # stop the egress proxy & exit
 
@@ -100,23 +101,6 @@ HOME_IN="$HOME"
 # all, so we can freely create a fresh tree there instead for wrapper
 # binaries (linker/findings/git-hooks).
 BIN_IN="/opt/csandbox-tools/bin"
-
-PROXY_PORT="${CSANDBOX_PROXY_PORT:-8888}"
-CONFIG_DIR="$HOME/.claude-sandbox"
-mkdir -p "$CONFIG_DIR"
-
-# teardown shortcut
-if [ "${CSANDBOX_DOWN:-}" = "1" ]; then
-  pidfile="$CONFIG_DIR/bwrap-proxy.pid"
-  if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
-    kill "$(cat "$pidfile")" 2>/dev/null || true
-    echo "csandbox: stopped the egress proxy (pid $(cat "$pidfile"))"
-  else
-    echo "csandbox: no egress proxy running"
-  fi
-  rm -f "$pidfile" "$CONFIG_DIR/bwrap-proxy.domains"
-  exit 0
-fi
 
 # --- backend selection + preflight -------------------------------------------
 # Two isolation backends, picked by OS (override with CSANDBOX_BACKEND):
@@ -168,6 +152,7 @@ LIVE=1                                 # default: agent edits the checked-out tr
 [ "${CSANDBOX_WORKTREE:-0}" = 1 ] && LIVE=0
 FINDINGS="${CSANDBOX_FINDINGS:-1}"   # external memory: on by default; --no-findings / CSANDBOX_FINDINGS=0 disables
 FINDINGS_EXPLICIT=0                    # set by --findings; warn only then if the tool is missing
+TENANT="${CSANDBOX_TENANT:-}"          # --tenant <name>: a separate config dir (= separate Claude account); see the tenant block below
 EDIT_GATE="${CSANDBOX_EDIT_GATE:-0}"   # OPT-IN PreToolUse fact-forcing gate on first edits (claude-hooks/edit-gate); 1 enables. Off by default: agents were observed treating the refusal as done and moving on without the edit
 ARGS=()
 while [ $# -gt 0 ]; do
@@ -176,10 +161,96 @@ while [ $# -gt 0 ]; do
     --worktree) LIVE=0; shift ;;                            # opt in to the top-level session worktree
     --findings) FINDINGS=1; FINDINGS_EXPLICIT=1; shift ;;   # explicit on (already the default)
     --no-findings) FINDINGS=0; shift ;;                     # opt out of the findings memory
+    --tenant) TENANT="${2:-}"; shift 2 2>/dev/null || shift ;; # run as a named tenant (own config dir + login + proxy port)
     *)      ARGS+=("$1"); shift ;;
   esac
 done
 set -- "${ARGS[@]+"${ARGS[@]}"}"
+
+# --- tenant: which Claude account this run belongs to -------------------------
+# A tenant is a Claude Code config dir (CLAUDE_CONFIG_DIR). Claude Code keeps
+# every account-shaped thing under that dir - the OAuth login, .claude.json
+# (account/org ids), settings, sessions, the cached server-managed org policy -
+# and under bwrap the host ~/.claude isn't even mounted, so tenants can't see
+# each other. Everything else (workspace, slice + nft rule, wrapper scripts,
+# the findings store) is per USER and shared.
+#   --tenant <name> / CSANDBOX_TENANT=<name>   -> ~/.claude-sandbox-<name>
+#   CSANDBOX_CONFIG_DIR=<dir>                   -> that dir (wins over --tenant)
+#   neither                                     -> ~/.claude-sandbox (the default tenant)
+if [ -n "${CSANDBOX_CONFIG_DIR:-}" ]; then CONFIG_DIR="$CSANDBOX_CONFIG_DIR"
+elif [ -n "$TENANT" ]; then CONFIG_DIR="$HOME/.claude-sandbox-$TENANT"
+else CONFIG_DIR="$HOME/.claude-sandbox"; fi
+mkdir -p "$CONFIG_DIR"
+DEFAULT_TENANT=0; [ "$CONFIG_DIR" = "$HOME/.claude-sandbox" ] && DEFAULT_TENANT=1
+TENANT_LABEL="${TENANT:-$([ "$DEFAULT_TENANT" = 1 ] && echo default || echo custom)}"
+
+# Host-side share dir: per user, OUTSIDE every config dir so no sandboxed agent
+# can see or mutate it. Wrapper scripts, hook copies and per-port proxy state.
+LOCAL_SHARE_DIR="$HOME/.local/share/csandbox"
+mkdir -p "$LOCAL_SHARE_DIR"
+
+# Every tenant runs its OWN egress proxy on its own loopback port: one shared
+# proxy would carry whichever tenant's allowlist restarted it last. The nft rule
+# (bwrap-setup) opens a small port RANGE for the slice and records it in
+# /etc/csandbox/proxy-ports ("MIN MAX"); the default tenant is MIN (8888), a
+# named tenant takes CSANDBOX_PROXY_PORT if set, else the lowest port in the
+# range no other ~/.claude-sandbox-* tenant has claimed, remembered in
+# <config>/proxy-port. (A CSANDBOX_CONFIG_DIR outside that naming isn't seen by
+# the scan - give it CSANDBOX_PROXY_PORT explicitly.)
+PORT_RANGE_FILE="${CSANDBOX_PORT_RANGE_FILE:-/etc/csandbox/proxy-ports}"
+PORT_MIN=8888; PORT_MAX=8888
+[ -f "$PORT_RANGE_FILE" ] && read -r PORT_MIN PORT_MAX < "$PORT_RANGE_FILE"
+if [ -n "${CSANDBOX_PROXY_PORT:-}" ]; then PROXY_PORT="$CSANDBOX_PROXY_PORT"
+elif [ "$DEFAULT_TENANT" = 1 ]; then PROXY_PORT="$PORT_MIN"
+elif [ -f "$CONFIG_DIR/proxy-port" ]; then PROXY_PORT="$(cat "$CONFIG_DIR/proxy-port")"
+else
+  _used=" $PORT_MIN "
+  for _f in "$HOME"/.claude-sandbox-*/proxy-port; do [ -f "$_f" ] && _used="$_used$(cat "$_f") "; done
+  PROXY_PORT=""; _p=$((PORT_MIN + 1))
+  while [ "$_p" -le "$PORT_MAX" ]; do
+    case "$_used" in *" $_p "*) ;; *) PROXY_PORT="$_p"; break ;; esac
+    _p=$((_p + 1))
+  done
+  if [ -z "$PROXY_PORT" ]; then
+    if [ ! -f "$PORT_RANGE_FILE" ]; then
+      echo "csandbox: tenant '$TENANT_LABEL' needs its own proxy port, but this bwrap-setup predates multi-tenant ports - re-run it once: sudo $SANDBOX_DIR/bwrap-setup" >&2
+    else
+      echo "csandbox: no free proxy port left in $PORT_MIN-$PORT_MAX for tenant '$TENANT_LABEL' (widen it: sudo CSANDBOX_PROXY_PORTS=8888-8919 $SANDBOX_DIR/bwrap-setup)" >&2
+    fi
+    exit 1
+  fi
+  echo "$PROXY_PORT" > "$CONFIG_DIR/proxy-port"
+fi
+# The nft rule only lets the slice reach ports in the recorded range; a port
+# outside it would be silently dropped, so refuse up front.
+if [ "$BACKEND" = bwrap ] && { [ "$PROXY_PORT" -lt "$PORT_MIN" ] || [ "$PROXY_PORT" -gt "$PORT_MAX" ]; }; then
+  echo "csandbox: proxy port $PROXY_PORT is outside the range the nft rule allows ($PORT_MIN-$PORT_MAX)." >&2
+  if [ ! -f "$PORT_RANGE_FILE" ]; then echo "csandbox: this bwrap-setup predates multi-tenant ports - re-run it once: sudo $SANDBOX_DIR/bwrap-setup" >&2; fi
+  exit 1
+fi
+PROXY_PIDFILE="$LOCAL_SHARE_DIR/proxy-$PROXY_PORT.pid"
+PROXY_DOMAINSFILE="$LOCAL_SHARE_DIR/proxy-$PROXY_PORT.domains"
+PROXY_LOGFILE="$LOCAL_SHARE_DIR/proxy-$PROXY_PORT.log"
+
+# pre-tenant layouts kept proxy state in the config dir; adopt it so an already
+# running proxy is reused rather than a second one racing for the same port
+if [ -f "$CONFIG_DIR/bwrap-proxy.pid" ]; then
+  mv -f "$CONFIG_DIR/bwrap-proxy.pid" "$PROXY_PIDFILE"
+  [ -f "$CONFIG_DIR/bwrap-proxy.domains" ] && mv -f "$CONFIG_DIR/bwrap-proxy.domains" "$PROXY_DOMAINSFILE"
+  [ -f "$CONFIG_DIR/bwrap-proxy.log" ] && cat "$CONFIG_DIR/bwrap-proxy.log" >> "$PROXY_LOGFILE" && rm -f "$CONFIG_DIR/bwrap-proxy.log"
+fi
+
+# teardown shortcut: stop THIS tenant's proxy
+if [ "${CSANDBOX_DOWN:-}" = "1" ]; then
+  if [ -f "$PROXY_PIDFILE" ] && kill -0 "$(cat "$PROXY_PIDFILE")" 2>/dev/null; then
+    kill "$(cat "$PROXY_PIDFILE")" 2>/dev/null || true
+    echo "csandbox: stopped the egress proxy for tenant '$TENANT_LABEL' (port $PROXY_PORT, pid $(cat "$PROXY_PIDFILE"))"
+  else
+    echo "csandbox: no egress proxy running for tenant '$TENANT_LABEL' (port $PROXY_PORT)"
+  fi
+  rm -f "$PROXY_PIDFILE" "$PROXY_DOMAINSFILE"
+  exit 0
+fi
 
 # first arg is the project dir if it's a directory, otherwise default to cwd
 if [ $# -gt 0 ] && [ -d "$1" ]; then
@@ -229,12 +300,6 @@ if [ -z "$SESSION_ID" ] && [ "$_has_session_flag" = 0 ] && [ "${CSANDBOX_SHELL:-
   SESSION_ID="$(gen_uuid)"
   MINT_SESSION_ARGS=(--session-id "$SESSION_ID")
 fi
-
-# local-share dir: host-side, OUTSIDE the bind-mounted config dir. Anchor for
-# wrapper scripts (linker/findings/memory-nudge below) that need a writable
-# spot the sandboxed agent can't see or mutate.
-LOCAL_SHARE_DIR="$HOME/.local/share/csandbox"
-mkdir -p "$LOCAL_SHARE_DIR"
 
 # Persistent scratch space for the agent. Writes under a .claude/ dir always
 # trigger Claude Code's hardcoded self-config guard (even with skip-
@@ -467,15 +532,23 @@ flag any stray node_modules symlink that isn't declared in links.json.
 EOF
 fi
 
-# The sandbox has its own login (token chain lives in ~/.claude-sandbox),
-# rather than a copy of the host credentials: OAuth refresh tokens rotate,
-# so a seeded copy dies as soon as the host client refreshes. First run:
-#   CSANDBOX_EXTRA_DOMAINS=claude.ai csandbox .   # then /login inside
+# Each tenant has its own login (token chain lives in its config dir), rather
+# than a copy of the host credentials: OAuth refresh tokens rotate, so a seeded
+# copy dies as soon as the host client refreshes. Two ways to give a tenant one:
+#   CSANDBOX_EXTRA_DOMAINS=claude.ai csandbox [--tenant x] .   # then /login inside
+#   claude setup-token > ~/.claude-sandbox-x/oauth-token         # one-year token, no login inside
+# The token file is exported as CLAUDE_CODE_OAUTH_TOKEN for that tenant only.
 # Skipped on seatbelt: macOS stores the token in the Keychain, not a
 # .credentials.json file, so this check would false-warn on every run.
-if [ "$BACKEND" != seatbelt ] && [ ! -f "$CONFIG_DIR/.credentials.json" ]; then
-  echo "csandbox: no sandbox login yet - run /login inside (needs claude.ai allowed):"
-  echo "csandbox:   CSANDBOX_EXTRA_DOMAINS=claude.ai csandbox ."
+TENANT_TOKEN=""
+if [ -f "$CONFIG_DIR/oauth-token" ]; then
+  TENANT_TOKEN="$(tr -d '[:space:]' < "$CONFIG_DIR/oauth-token")"
+  chmod 600 "$CONFIG_DIR/oauth-token" 2>/dev/null || true
+fi
+if [ "$BACKEND" != seatbelt ] && [ ! -f "$CONFIG_DIR/.credentials.json" ] && [ -z "$TENANT_TOKEN" ]; then
+  echo "csandbox: tenant '$TENANT_LABEL' has no login yet - run /login inside (needs claude.ai allowed):"
+  echo "csandbox:   CSANDBOX_EXTRA_DOMAINS=claude.ai csandbox${TENANT:+ --tenant $TENANT} ."
+  echo "csandbox: or store a one-year token: claude setup-token > $CONFIG_DIR/oauth-token"
 fi
 
 # a fresh container generates its own .claude.json (own machineID/userID)
@@ -586,11 +659,12 @@ if [ -n "$FINDINGS_DIR" ]; then
   FINDINGS_WRAPPER="$LOCAL_SHARE_DIR/findings-wrapper"
   printf '#!/bin/sh\nexec node /opt/findings/cli.js "$@"\n' > "$FINDINGS_WRAPPER"
   chmod +x "$FINDINGS_WRAPPER"
-  mkdir -p "$HOME/.findings"
+  FINDINGS_HOME="${CSANDBOX_FINDINGS_HOME:-$HOME/.findings}"   # shared across tenants by default
+  mkdir -p "$FINDINGS_HOME"
   add_mount ro "$FINDINGS_DIR" /opt/findings
   add_mount ro "$FINDINGS_WRAPPER" "$BIN_IN/findings"
-  add_mount rw "$HOME/.findings" "$HOME_IN/.findings"   # rw: shared store + telemetry trace
-  FINDINGS_EVENTS="$HOME_IN/.findings/events.jsonl"
+  add_mount rw "$FINDINGS_HOME" "$FINDINGS_HOME"   # rw: shared store + telemetry trace (same path inside)
+  FINDINGS_EVENTS="$FINDINGS_HOME/events.jsonl"
   # Hook scripts (claude-hooks/): copied to the host-side share dir and mounted
   # on PATH. Under bwrap they are reached at $BIN_IN/<name>; seatbelt applies no
   # mounts, so it runs them at their host path.
@@ -726,6 +800,10 @@ HOME_SECRETS=(
   "$HOME/.config/gh" "$HOME/.npmrc" "$HOME/.netrc" "$HOME/.docker/config.json"
   "$HOME/.kube/config" "$HOME/.git-credentials" "$HOME/.claude/.credentials.json"
 )
+# other tenants' logins (seatbelt leaves $HOME visible; bwrap never mounts them)
+for _d in "$HOME"/.claude-sandbox "$HOME"/.claude-sandbox-*; do
+  [ -d "$_d" ] && [ "$_d" != "$CONFIG_DIR" ] && HOME_SECRETS+=("$_d/.credentials.json" "$_d/oauth-token")
+done
 
 # --- egress allowlist ---------------------------------------------------
 profile_domains() {
@@ -804,7 +882,7 @@ else
     CLAUDE_ARGS+=(--append-system-prompt "This session was launched with csandbox --worktree: follow the WITH --worktree path of the 'Top-level session worktree' section in CLAUDE.md - check you are not already inside a .claude/worktrees path, otherwise call EnterWorktree before touching files, work on that disposable branch for the whole session, and leave it for the user to review (no push/PR/merge).")
   fi
   if [ -n "$FINDINGS_DIR" ]; then
-    CLAUDE_ENV+=("FINDINGS_DB=$HOME_IN/.findings/findings.db" "FINDINGS_EVENTS=$FINDINGS_EVENTS")
+    CLAUDE_ENV+=("FINDINGS_DB=$FINDINGS_HOME/findings.db" "FINDINGS_EVENTS=$FINDINGS_EVENTS")
     [ -n "$SESSION_ID" ] && CLAUDE_ENV+=("FINDINGS_SESSION=$SESSION_ID")
     # The guide lives at the mounted /opt path under bwrap, but at its real host
     # path under seatbelt (which doesn't relocate the filesystem).
@@ -818,11 +896,17 @@ else
   if [ "$BACKEND" = bwrap ]; then
     CLAUDE_ENV+=("HTTP_PROXY=http://127.0.0.1:$PROXY_PORT" "HTTPS_PROXY=http://127.0.0.1:$PROXY_PORT" "NO_PROXY=localhost,127.0.0.1")
   fi
-  CMD=(env "${CLAUDE_ENV[@]}" claude "${CLAUDE_ARGS[@]}" "$@")
+  # Host-side credentials outrank a tenant's stored login in Claude Code's
+  # precedence (API key, bearer token, OAuth token, named profile), and bwrap
+  # passes the host environment through - so strip them, then add the
+  # tenant's own token if it has one.
+  [ -n "$TENANT_TOKEN" ] && CLAUDE_ENV+=("CLAUDE_CODE_OAUTH_TOKEN=$TENANT_TOKEN")
+  CMD=(env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_PROFILE
+       "${CLAUDE_ENV[@]}" claude "${CLAUDE_ARGS[@]}" "$@")
 fi
 
 # --- launch -------------------------------------------------------------
-echo "csandbox: backend $BACKEND"
+echo "csandbox: backend $BACKEND, tenant '$TENANT_LABEL' -> $CONFIG_DIR (proxy :$PROXY_PORT)"
 echo "csandbox: mount $ROOT ($MOUNT_NOTE), $SCRUB_COUNT secret file(s) shadowed"
 echo "csandbox: egress allowlist -> $ALLOWED_DOMAINS"
 [ -n "$LINKER_DIR" ] && echo "csandbox: linker -> $LINKER_DIR (declarative local links wired per-worktree)"
@@ -851,9 +935,9 @@ BLOCKED=""
 launch_bwrap() {
   # host-side proxy lifecycle: reuse a running instance unless the resolved
   # allowlist changed, restarting it otherwise.
-  local pidfile="$CONFIG_DIR/bwrap-proxy.pid"
-  local domainsfile="$CONFIG_DIR/bwrap-proxy.domains"
-  local logfile="$CONFIG_DIR/bwrap-proxy.log"
+  local pidfile="$PROXY_PIDFILE"
+  local domainsfile="$PROXY_DOMAINSFILE"
+  local logfile="$PROXY_LOGFILE"
   local running=0
   if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; then running=1; fi
   if [ "$running" = 1 ] && [ "$(cat "$domainsfile" 2>/dev/null || true)" = "$ALLOWED_DOMAINS" ]; then
@@ -865,6 +949,10 @@ launch_bwrap() {
       echo $! > "$pidfile")
     echo "$ALLOWED_DOMAINS" > "$domainsfile"
     sleep 0.3   # let it bind before the sandboxed process starts dialing out
+    if ! kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+      echo "csandbox: egress proxy failed to start on 127.0.0.1:$PROXY_PORT (port taken by another process? see $logfile)" >&2
+      rm -f "$pidfile" "$domainsfile"; exit 1
+    fi
   fi
   local proxy_log_start; proxy_log_start="$(wc -l < "$logfile" 2>/dev/null || echo 0)"
 
