@@ -63,8 +63,8 @@
 # Convention: per-invocation choices are FLAGS; every flag has an environment
 # variable as its default (CSANDBOX_PROFILE, CSANDBOX_TENANT, ...), so a shell
 # profile can pin a preference. Machine configuration is environment-only:
-# CSANDBOX_ROOT (workspace root), CSANDBOX_BACKEND, CSANDBOX_FINDINGS_DIR (tool
-# location), CSANDBOX_FINDINGS_HOME (store override). Flags are parsed anywhere
+# CSANDBOX_BACKEND, CSANDBOX_FINDINGS_DIR (tool location), CSANDBOX_FINDINGS_HOME
+# (store override). --root is remembered per tenant (<config>/root). Flags are parsed anywhere
 # in the argument list and shadow same-named claude flags (--worktree); claude's
 # short forms (-w) still pass through.
 
@@ -168,6 +168,8 @@ variable default (in brackets); the variable is what hooks and subprocesses see.
   --proxy-port <n>       this tenant's egress proxy port             [CSANDBOX_PROXY_PORT]
   --profile <p[,p]>      egress profile(s): minimal|node|git|python|dev  [CSANDBOX_PROFILE]
   --allow <host[,host]>  extra allowed hosts, repeatable             [CSANDBOX_EXTRA_DOMAINS]
+  --root <dir>           workspace root to mount; remembered per tenant in
+                         <config>/root (delete the file to forget)   [CSANDBOX_ROOT]
   --readonly             mount the workspace read-only               [CSANDBOX_READONLY=1]
   --worktree             agent works on a disposable session worktree
                          (default: edits the checked-out tree)       [CSANDBOX_WORKTREE=1]
@@ -179,7 +181,6 @@ variable default (in brackets); the variable is what hooks and subprocesses see.
   -h, --help             this text (only as the first argument; later it goes to claude)
 
 environment-only (machine configuration):
-  CSANDBOX_ROOT          workspace root to mount (default: ~/hyper when the project is under it)
   CSANDBOX_BACKEND       bwrap | seatbelt (default by OS)
   CSANDBOX_FINDINGS_DIR  where the findings tool lives (default: PATH, then ~/dev/findings)
   CSANDBOX_FINDINGS_HOME findings store override (default: ~/.findings for the default
@@ -200,6 +201,7 @@ while [ $# -gt 0 ]; do
     --proxy-port)    export CSANDBOX_PROXY_PORT="${2:-}"; shift 2 2>/dev/null || shift ;;
     --profile)       export CSANDBOX_PROFILE="${2:-}"; shift 2 2>/dev/null || shift ;;
     --allow)         export CSANDBOX_EXTRA_DOMAINS="${CSANDBOX_EXTRA_DOMAINS:+$CSANDBOX_EXTRA_DOMAINS,}${2:-}"; shift 2 2>/dev/null || shift ;;
+    --root)          export CSANDBOX_ROOT="${2:-}" CSANDBOX_ROOT_SAVE=1; shift 2 2>/dev/null || shift ;;
     --readonly)      export CSANDBOX_READONLY=1; shift ;;
     --worktree)      export CSANDBOX_WORKTREE=1; shift ;;
     --live)          export CSANDBOX_WORKTREE=0; shift ;;
@@ -236,6 +238,22 @@ else CONFIG_DIR="$HOME/.claude-sandbox"; fi
 mkdir -p "$CONFIG_DIR"
 DEFAULT_TENANT=0; [ "$CONFIG_DIR" = "$HOME/.claude-sandbox" ] && DEFAULT_TENANT=1
 TENANT_LABEL="${TENANT:-$([ "$DEFAULT_TENANT" = 1 ] && echo default || echo custom)}"
+
+# A tenant can be scoped to a workspace root: `--root <dir>` is remembered in
+# <config>/root and applies to every later run of that tenant (a tenant for a
+# client's code stays inside that tree). Precedence: --root > CSANDBOX_ROOT in
+# the environment > the remembered root > the ~/hyper heuristic below. Delete
+# the file to forget. With a root in effect and no project dir given, a run
+# started outside the root lands at the root instead of failing.
+ROOT_FILE="$CONFIG_DIR/root"
+if [ "${CSANDBOX_ROOT_SAVE:-0}" = 1 ]; then
+  [ -d "$CSANDBOX_ROOT" ] || { echo "csandbox: --root $CSANDBOX_ROOT is not a directory" >&2; exit 1; }
+  CSANDBOX_ROOT="$(cd "$CSANDBOX_ROOT" && pwd -P)"; export CSANDBOX_ROOT
+  printf '%s\n' "$CSANDBOX_ROOT" > "$ROOT_FILE"
+elif [ -z "${CSANDBOX_ROOT:-}" ] && [ -s "$ROOT_FILE" ]; then
+  CSANDBOX_ROOT="$(head -n1 "$ROOT_FILE")"; export CSANDBOX_ROOT
+  [ -d "$CSANDBOX_ROOT" ] || { echo "csandbox: tenant '$TENANT_LABEL' remembers root $CSANDBOX_ROOT but it no longer exists - fix it with --root <dir> or delete $ROOT_FILE" >&2; exit 1; }
+fi
 
 # Host-side share dir: per user, OUTSIDE every config dir so no sandboxed agent
 # can see or mutate it. Wrapper scripts, hook copies and per-port proxy state.
@@ -311,6 +329,11 @@ if [ $# -gt 0 ] && [ -d "$1" ]; then
   shift
 else
   PROJECT_DIR="$PWD"
+  # no project dir given and cwd is outside the root in effect: start at the root
+  if [ -n "${CSANDBOX_ROOT:-}" ]; then
+    _root="$(cd "$CSANDBOX_ROOT" && pwd -P)"
+    case "$PROJECT_DIR" in "$_root" | "$_root"/*) ;; *) PROJECT_DIR="$_root" ;; esac
+  fi
 fi
 
 # workspace root: explicit override > ~/hyper (if the project is inside it,

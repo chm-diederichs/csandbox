@@ -129,6 +129,7 @@ prints the same table.
 | ------------------------- | ------------------------- | --------------------------------------------------------------------------------------- |
 | `--profile <p[,p]>`       | `CSANDBOX_PROFILE`        | Egress profile(s). Default `minimal` (`node` / `git` / `python` / `dev`).               |
 | `--allow <host[,host]>`   | `CSANDBOX_EXTRA_DOMAINS`  | Extra hosts to allow on top of the profile(s); repeatable.                              |
+| `--root <dir>`            | `CSANDBOX_ROOT`           | Workspace root to mount; **remembered per tenant** in `<config>/root` and applied to every later run of that tenant (delete the file to forget). Default: `~/hyper` when the project is under it, else the project dir. A run started outside the root with no project dir lands at the root. |
 | `--readonly`              | `CSANDBOX_READONLY=1`     | Mount the workspace read-only.                                                          |
 | `--worktree`              | `CSANDBOX_WORKTREE=1`     | Agent works on a disposable session worktree instead of your tree. `--live` is the default. |
 | `--tenant <name>`         | `CSANDBOX_TENANT`         | Second Claude account: config dir `~/.claude-sandbox-<name>`, own login, proxy port and findings store. |
@@ -144,26 +145,10 @@ Machine configuration is environment-only:
 
 | Variable                 | Effect                                                                                  |
 | ------------------------ | --------------------------------------------------------------------------------------- |
-| `CSANDBOX_ROOT`          | Workspace root to mount. Defaults to all of `~/hyper` when the project is under it (so cross-repo npm links resolve); otherwise the project dir. |
 | `CSANDBOX_BACKEND`       | `bwrap` (Linux) or `seatbelt` (macOS); defaults by OS.                                  |
 | `CSANDBOX_FINDINGS_DIR`  | Where the findings tool lives (default: `findings` on PATH, then `~/dev/findings`).     |
 | `CSANDBOX_FINDINGS_HOME` | Findings store override. Default `~/.findings` for the default tenant, `<config>/findings` for a named one - per account unless you point two tenants at one dir. |
 
------------------------- | --------------------------------------------------------------------------------------- |
-| `CSANDBOX_PROFILE`       | Egress profile(s), comma-separated. Default `minimal`. (`node` / `git` / `python` / `dev`) |
-| `CSANDBOX_EXTRA_DOMAINS` | Comma-separated extra hosts to allow, on top of the profile(s).                          |
-| `CSANDBOX_ROOT`          | Workspace root to mount. Defaults to all of `~/hyper` when the project is under it (so cross-repo npm links resolve); otherwise the project dir. |
-| `CSANDBOX_READONLY=1`    | Mount the workspace read-only.                                                           |
-| `CSANDBOX_SHELL=1`       | Drop into `bash` inside the sandbox instead of launching `claude`.                       |
-| `CSANDBOX_DRYRUN=1`      | Print the resolved config (mounts, allowlist) and exit without launching.               |
-| `CSANDBOX_DOWN=1`        | Stop the egress proxy, then exit.                                                        |
-| `CSANDBOX_TENANT=<name>` | Run as a named tenant: config dir `~/.claude-sandbox-<name>`, its own login and egress proxy port (`--tenant <name>` does the same). |
-| `CSANDBOX_CONFIG_DIR`    | Explicit config dir for this run (wins over the tenant name). Set `CSANDBOX_PROXY_PORT` with it. |
-| `CSANDBOX_PROXY_PORT`    | Loopback port for this tenant's egress proxy. Default tenant: 8888; named tenants are allocated one from the range `bwrap-setup` opened. |
-| `CSANDBOX_FINDINGS_HOME` | Findings store dir. Default: `~/.findings` for the default tenant, `<config>/findings` for a named one - per account, never shared unless you point two tenants at one dir. |
-| `CSANDBOX_WORKTREE=1`    | Agent works on a disposable session worktree instead of your tree (`--worktree` does the same). |
-| `CSANDBOX_EDIT_GATE=1`   | Enable the opt-in edit gate hook: the first edit to an existing source file is refused once with a fact request (importers, exports, formats). Off by default. |
-| `CSANDBOX_FINDINGS=0`    | Disable the findings memory for this run (`--no-findings` does the same).                |
 
 ---
 
@@ -311,10 +296,16 @@ default). Set `CSANDBOX_FINDINGS_HOME` on two tenants to the same dir if you
 want them to share deliberately.
 
 ```bash
-csandbox --tenant work .                                  # ~/.claude-sandbox-work
+csandbox --tenant work --root ~/work .                    # ~/.claude-sandbox-work, scoped to ~/work from now on
 csandbox --tenant work --allow claude.ai .                # first run: /login inside
 claude setup-token > ~/.claude-sandbox-work/oauth-token   # or: a one-year token, no login inside
+csandbox --tenant work                                    # later: from anywhere, lands in ~/work
 ```
+
+A tenant can be **scoped to a workspace root**: `--root` is remembered in the
+tenant's config dir and applies to every later run, so a tenant for one
+client's code only ever mounts that tree. `CSANDBOX_ROOT` in the environment
+overrides it for a run without rewriting it; `--root` again replaces it.
 
 Each tenant runs its **own egress proxy on its own loopback port**, so tenants
 with different allowlists don't restart each other's proxy: the default tenant
