@@ -35,7 +35,7 @@ host credentials doesn't survive: OAuth refresh tokens rotate, so a seeded copy
 dies as soon as the host client refreshes). First run only:
 
 ```bash
-csandbox --allow claude.ai .   # then /login inside
+csandbox --profile login .     # then /login inside
 ```
 
 After that, launches need no extra domains — token refresh goes through
@@ -100,6 +100,7 @@ next time.
 | `git`     | `github.com`, `codeload.github.com`, `raw.githubusercontent.com`, `objects.githubusercontent.com`, `gist.githubusercontent.com` |
 | `python`  | `pypi.org`, `files.pythonhosted.org`                                                      |
 | `dev`     | `node` + `git` + `python` (general coding with installs)                                  |
+| `login`   | `claude.ai`, for the `/login` browser flow - a tenant's first run only                    |
 
 Profiles combine: `--profile node,git`.
 
@@ -127,7 +128,7 @@ prints the same table.
 
 | Flag                      | Env var                   | Effect                                                                                  |
 | ------------------------- | ------------------------- | --------------------------------------------------------------------------------------- |
-| `--profile <p[,p]>`       | `CSANDBOX_PROFILE`        | Egress profile(s). Default `minimal` (`node` / `git` / `python` / `dev`).               |
+| `--profile <p[,p]>`       | `CSANDBOX_PROFILE`        | Egress profile(s). Default `minimal` (`node` / `git` / `python` / `dev` / `login`).               |
 | `--allow <host[,host]>`   | `CSANDBOX_EXTRA_DOMAINS`  | Extra hosts to allow on top of the profile(s); repeatable.                              |
 | `--root <dir>`            | `CSANDBOX_ROOT`           | Workspace root to mount; **remembered per tenant** in `<config>/root` and applied to every later run of that tenant (delete the file to forget). Default: `~/hyper` when the project is under it, else the project dir. A run started outside the root with no project dir lands at the root. |
 | `--readonly`              | `CSANDBOX_READONLY=1`     | Mount the workspace read-only.                                                          |
@@ -297,7 +298,7 @@ want them to share deliberately.
 
 ```bash
 csandbox --tenant work --root ~/work .                    # ~/.claude-sandbox-work, scoped to ~/work from now on
-csandbox --tenant work --allow claude.ai .                # first run: /login inside
+csandbox --tenant work --profile login .                  # first run: /login inside
 claude setup-token > ~/.claude-sandbox-work/oauth-token   # or: a one-year token, no login inside
 csandbox --tenant work                                    # later: from anywhere, lands in ~/work
 ```
@@ -367,7 +368,7 @@ Requires: Linux, with `bubblewrap`, `nftables`, `apparmor`, and a systemd user
 session (see `bwrap-setup`'s header for exactly why each is needed). `bwrap-setup`
 opens loopback ports `8888-8899` for the sandbox slice (one per tenant); set
 `CSANDBOX_PROXY_PORTS=MIN-MAX` when running it to change that. On first
-launch, log the sandbox in with `csandbox --allow claude.ai .` then `/login`
+launch, log the sandbox in with `csandbox --profile login .` then `/login`
 inside.
 
 ---

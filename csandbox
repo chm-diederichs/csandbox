@@ -166,7 +166,7 @@ variable default (in brackets); the variable is what hooks and subprocesses see.
                          own login, proxy port and findings store   [CSANDBOX_TENANT]
   --config-dir <dir>     explicit config dir (wins over --tenant)    [CSANDBOX_CONFIG_DIR]
   --proxy-port <n>       this tenant's egress proxy port             [CSANDBOX_PROXY_PORT]
-  --profile <p[,p]>      egress profile(s): minimal|node|git|python|dev  [CSANDBOX_PROFILE]
+  --profile <p[,p]>      egress profile(s): minimal|node|git|python|dev|login  [CSANDBOX_PROFILE]
   --allow <host[,host]>  extra allowed hosts, repeatable             [CSANDBOX_EXTRA_DOMAINS]
   --root <dir>           workspace root to mount; remembered per tenant in
                          <config>/root (delete the file to forget)   [CSANDBOX_ROOT]
@@ -611,7 +611,7 @@ fi
 # Each tenant has its own login (token chain lives in its config dir), rather
 # than a copy of the host credentials: OAuth refresh tokens rotate, so a seeded
 # copy dies as soon as the host client refreshes. Two ways to give a tenant one:
-#   csandbox --allow claude.ai [--tenant x] .   # then /login inside
+#   csandbox --profile login [--tenant x] .     # then /login inside
 #   claude setup-token > ~/.claude-sandbox-x/oauth-token         # one-year token, no login inside
 # The token file is exported as CLAUDE_CODE_OAUTH_TOKEN for that tenant only.
 # Skipped on seatbelt: macOS stores the token in the Keychain, not a
@@ -622,8 +622,8 @@ if [ -f "$CONFIG_DIR/oauth-token" ]; then
   chmod 600 "$CONFIG_DIR/oauth-token" 2>/dev/null || true
 fi
 if [ "$BACKEND" != seatbelt ] && [ ! -f "$CONFIG_DIR/.credentials.json" ] && [ -z "$TENANT_TOKEN" ]; then
-  echo "csandbox: tenant '$TENANT_LABEL' has no login yet - run /login inside (needs claude.ai allowed):"
-  echo "csandbox:   csandbox --allow claude.ai${TENANT:+ --tenant $TENANT} ."
+  echo "csandbox: tenant '$TENANT_LABEL' has no login yet - run /login inside:"
+  echo "csandbox:   csandbox --profile login${TENANT:+ --tenant $TENANT} ."
   echo "csandbox: or store a one-year token: claude setup-token > $CONFIG_DIR/oauth-token"
 fi
 
@@ -900,6 +900,7 @@ profile_domains() {
     node)    echo "registry.npmjs.org registry.yarnpkg.com" ;;
     git)     echo "github.com codeload.github.com raw.githubusercontent.com objects.githubusercontent.com gist.githubusercontent.com" ;;
     python)  echo "pypi.org files.pythonhosted.org" ;;
+    login)   echo "claude.ai" ;;   # the /login browser flow; only needed for a tenant's first run
     dev)     echo "$(profile_domains node) $(profile_domains git) $(profile_domains python)" ;;
     *)       echo "__UNKNOWN__:$1" ;;
   esac
@@ -915,7 +916,7 @@ for p in "${PROFILES[@]}"; do
   [ -z "$p" ] && continue
   for d in $(profile_domains "$p"); do
     if [[ "$d" == __UNKNOWN__:* ]]; then
-      echo "error: unknown profile '${d#__UNKNOWN__:}' (valid: minimal node git python dev)" >&2
+      echo "error: unknown profile '${d#__UNKNOWN__:}' (valid: minimal node git python dev login)" >&2
       exit 1
     fi
     DOMAIN_SET+=("$d")
