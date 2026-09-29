@@ -23,10 +23,11 @@ no daemon, no image, no build step.
 ```bash
 csandbox                       # sandbox the current directory (minimal egress)
 csandbox ~/code/myapp          # sandbox a specific project
-csandbox . --continue          # trailing args are passed to `claude`
+csandbox . --continue          # unknown args are passed to `claude`
+csandbox --profile dev .       # allow npm + git + pypi for this session
 csandbox --worktree .          # agent works on a disposable branch instead of your tree (see below)
-csandbox --tenant work .       # a second Claude account: own config dir, login and proxy port (see below)
-CSANDBOX_PROFILE=dev csandbox . # allow npm + git + pypi for this session
+csandbox --tenant work .       # a second Claude account: own config dir, login, proxy port, findings (see below)
+csandbox --help                # every flag, and the env var each one defaults from
 ```
 
 The sandbox has its **own login**, stored in `~/.claude-sandbox` (copying the
@@ -34,7 +35,7 @@ host credentials doesn't survive: OAuth refresh tokens rotate, so a seeded copy
 dies as soon as the host client refreshes). First run only:
 
 ```bash
-CSANDBOX_EXTRA_DOMAINS=claude.ai csandbox .   # then /login inside
+csandbox --allow claude.ai .   # then /login inside
 ```
 
 After that, launches need no extra domains — token refresh goes through
@@ -83,12 +84,12 @@ The allowlist is built from three layers, unioned and deduplicated:
    expires, a few hours in), always present. `api.anthropic.com` is
    single-tenant Anthropic space, not a shared CDN, so it is not a
    domain-fronting substrate.
-2. **`CSANDBOX_PROFILE`** — one or more comma-separated profiles (default `minimal`).
-3. **`CSANDBOX_EXTRA_DOMAINS`** — comma-separated one-off additions.
+2. **`--profile`** (`CSANDBOX_PROFILE`) — one or more comma-separated profiles (default `minimal`).
+3. **`--allow`** (`CSANDBOX_EXTRA_DOMAINS`) — comma-separated one-off additions, repeatable.
 
 The resolved allowlist is printed at launch, and any hosts **blocked during the
-session are reported on exit**, with the exact `CSANDBOX_EXTRA_DOMAINS=…` needed to
-allow them next time.
+session are reported on exit**, with the exact `--allow …` needed to allow them
+next time.
 
 ### Profiles
 
@@ -100,13 +101,13 @@ allow them next time.
 | `python`  | `pypi.org`, `files.pythonhosted.org`                                                      |
 | `dev`     | `node` + `git` + `python` (general coding with installs)                                  |
 
-Profiles combine: `CSANDBOX_PROFILE=node,git`.
+Profiles combine: `--profile node,git`.
 
 ```bash
-csandbox .                                        # minimal: Anthropic only
-CSANDBOX_PROFILE=node csandbox .                  # + npm/yarn
-CSANDBOX_PROFILE=dev csandbox .                   # + npm/yarn/github/pypi
-CSANDBOX_EXTRA_DOMAINS=example.com csandbox .     # one-off host
+csandbox .                                 # minimal: Anthropic only
+csandbox --profile node .                  # + npm/yarn
+csandbox --profile dev .                   # + npm/yarn/github/pypi
+csandbox --allow example.com .             # one-off host
 ```
 
 Why isn't npm/github in the default? They live on **shared CDNs** (Cloudflare /
@@ -116,10 +117,39 @@ profiles trade some of that for convenience.
 
 ---
 
-## Environment variables
+## Flags and environment variables
+
+Per-invocation choices are flags. Every flag has an environment variable as its
+default, so a shell profile can pin a preference, and the variable is what hooks
+and subprocesses inside the sandbox see. Flags are recognised anywhere in the
+argument list; anything else passes through to `claude`. `csandbox --help`
+prints the same table.
+
+| Flag                      | Env var                   | Effect                                                                                  |
+| ------------------------- | ------------------------- | --------------------------------------------------------------------------------------- |
+| `--profile <p[,p]>`       | `CSANDBOX_PROFILE`        | Egress profile(s). Default `minimal` (`node` / `git` / `python` / `dev`).               |
+| `--allow <host[,host]>`   | `CSANDBOX_EXTRA_DOMAINS`  | Extra hosts to allow on top of the profile(s); repeatable.                              |
+| `--readonly`              | `CSANDBOX_READONLY=1`     | Mount the workspace read-only.                                                          |
+| `--worktree`              | `CSANDBOX_WORKTREE=1`     | Agent works on a disposable session worktree instead of your tree. `--live` is the default. |
+| `--tenant <name>`         | `CSANDBOX_TENANT`         | Second Claude account: config dir `~/.claude-sandbox-<name>`, own login, proxy port and findings store. |
+| `--config-dir <dir>`      | `CSANDBOX_CONFIG_DIR`     | Explicit config dir (wins over the tenant name). Pair with `--proxy-port`.              |
+| `--proxy-port <n>`        | `CSANDBOX_PROXY_PORT`     | This tenant's egress proxy port. Default tenant 8888; named tenants are allocated one from the range `bwrap-setup` opened. |
+| `--findings` / `--no-findings` | `CSANDBOX_FINDINGS=0` | Cross-session findings memory, on by default.                                           |
+| `--edit-gate`             | `CSANDBOX_EDIT_GATE=1`    | Opt-in hook: the first edit to an existing source file is refused once with a fact request. Off by default. |
+| `--shell`                 | `CSANDBOX_SHELL=1`        | Drop into `bash` inside the sandbox instead of launching `claude`.                      |
+| `--dry-run`               | `CSANDBOX_DRYRUN=1`       | Print the resolved config (mounts, allowlist) and exit without launching.               |
+| `down` (subcommand)       | `CSANDBOX_DOWN=1`         | Stop this tenant's egress proxy, then exit.                                             |
+
+Machine configuration is environment-only:
 
 | Variable                 | Effect                                                                                  |
 | ------------------------ | --------------------------------------------------------------------------------------- |
+| `CSANDBOX_ROOT`          | Workspace root to mount. Defaults to all of `~/hyper` when the project is under it (so cross-repo npm links resolve); otherwise the project dir. |
+| `CSANDBOX_BACKEND`       | `bwrap` (Linux) or `seatbelt` (macOS); defaults by OS.                                  |
+| `CSANDBOX_FINDINGS_DIR`  | Where the findings tool lives (default: `findings` on PATH, then `~/dev/findings`).     |
+| `CSANDBOX_FINDINGS_HOME` | Findings store override. Default `~/.findings` for the default tenant, `<config>/findings` for a named one - per account unless you point two tenants at one dir. |
+
+------------------------ | --------------------------------------------------------------------------------------- |
 | `CSANDBOX_PROFILE`       | Egress profile(s), comma-separated. Default `minimal`. (`node` / `git` / `python` / `dev`) |
 | `CSANDBOX_EXTRA_DOMAINS` | Comma-separated extra hosts to allow, on top of the profile(s).                          |
 | `CSANDBOX_ROOT`          | Workspace root to mount. Defaults to all of `~/hyper` when the project is under it (so cross-repo npm links resolve); otherwise the project dir. |
@@ -282,7 +312,7 @@ want them to share deliberately.
 
 ```bash
 csandbox --tenant work .                                  # ~/.claude-sandbox-work
-CSANDBOX_EXTRA_DOMAINS=claude.ai csandbox --tenant work . # first run: /login inside
+csandbox --tenant work --allow claude.ai .                # first run: /login inside
 claude setup-token > ~/.claude-sandbox-work/oauth-token   # or: a one-year token, no login inside
 ```
 
@@ -292,8 +322,8 @@ uses 8888, a named tenant is allocated the next free port in the range
 `bwrap-setup` opened in the nft rule (default `8888-8899`, recorded in
 `/etc/csandbox/proxy-ports`) and remembers it in `<config>/proxy-port`.
 A setup that predates this needs one re-run: `sudo ./bwrap-setup`
-(`CSANDBOX_PROXY_PORTS=8888-8919` for more tenants). `CSANDBOX_DOWN=1 csandbox
---tenant work` stops that tenant's proxy only.
+(`CSANDBOX_PROXY_PORTS=8888-8919` for more tenants). `csandbox down --tenant work`
+stops that tenant's proxy only.
 
 Two credentials paths: a browser `/login` inside the sandbox (refresh token
 rotates, renew about monthly for unattended use), or a one-year token from
@@ -346,8 +376,8 @@ Requires: Linux, with `bubblewrap`, `nftables`, `apparmor`, and a systemd user
 session (see `bwrap-setup`'s header for exactly why each is needed). `bwrap-setup`
 opens loopback ports `8888-8899` for the sandbox slice (one per tenant); set
 `CSANDBOX_PROXY_PORTS=MIN-MAX` when running it to change that. On first
-launch, log the sandbox in with `CSANDBOX_EXTRA_DOMAINS=claude.ai csandbox .`
-then `/login` inside.
+launch, log the sandbox in with `csandbox --allow claude.ai .` then `/login`
+inside.
 
 ---
 
@@ -362,7 +392,7 @@ then `/login` inside.
   host `PATH` (bwrap bind-mounts the host's node/claude install read-only,
   autoupdater disabled inside the sandbox) — update it on the host as usual.
 
-- **Tear down the running proxy:** `CSANDBOX_DOWN=1 csandbox` (add `--tenant <name>` for a tenant's).
+- **Tear down the running proxy:** `csandbox down` (add `--tenant <name>` for a tenant's).
 
 - **Re-run `bwrap-setup`:** safe any time (every step replaces its prior state);
   needed again only if the AppArmor profile, slice, or nft rule get reset

@@ -49,17 +49,24 @@
 # Examples:
 #   csandbox                                     # sandbox cwd, minimal egress
 #   csandbox ~/code/myapp
-#   csandbox . --continue                        # extra args go to claude
-#   CSANDBOX_PROFILE=dev csandbox .              # allow npm + git + pypi
-#   CSANDBOX_PROFILE=node,git csandbox .         # combine profiles
-#   CSANDBOX_EXTRA_DOMAINS=example.com csandbox . # one-off host
-#   CSANDBOX_ROOT=~/src csandbox .               # custom workspace root
-#   CSANDBOX_READONLY=1 csandbox .               # mount workspace read-only
-#   CSANDBOX_SHELL=1 csandbox .                  # drop into bash, not claude
-#   csandbox --worktree .                        # agent works on a disposable branch/worktree (default: edits the tree directly)
-#   csandbox --tenant work .                     # a second Claude account: own config dir, login, proxy port
-#   CSANDBOX_DRYRUN=1 csandbox .                 # print resolved config & exit
-#   CSANDBOX_DOWN=1 csandbox                     # stop the egress proxy & exit
+#   csandbox . --continue                        # unknown args go to claude
+#   csandbox --profile dev .                     # allow npm + git + pypi
+#   csandbox --profile node,git --allow example.com .   # combine profiles, one-off host
+#   csandbox --readonly .                        # mount workspace read-only
+#   csandbox --shell .                           # drop into bash, not claude
+#   csandbox --worktree .                        # agent works on a disposable branch (default: edits the tree directly)
+#   csandbox --tenant work .                     # a second Claude account: own config dir, login, proxy port, findings
+#   csandbox --dry-run .                         # print resolved config & exit
+#   csandbox down [--tenant work]                # stop that tenant's egress proxy & exit
+#   csandbox --help
+#
+# Convention: per-invocation choices are FLAGS; every flag has an environment
+# variable as its default (CSANDBOX_PROFILE, CSANDBOX_TENANT, ...), so a shell
+# profile can pin a preference. Machine configuration is environment-only:
+# CSANDBOX_ROOT (workspace root), CSANDBOX_BACKEND, CSANDBOX_FINDINGS_DIR (tool
+# location), CSANDBOX_FINDINGS_HOME (store override). Flags are parsed anywhere
+# in the argument list and shadow same-named claude flags (--worktree); claude's
+# short forms (-w) still pass through.
 
 set -euo pipefail
 
@@ -147,25 +154,71 @@ esac
 MOUNT_MODE=(); MOUNT_SRC=(); MOUNT_DST=()
 add_mount() { MOUNT_MODE+=("$1"); MOUNT_SRC+=("$2"); MOUNT_DST+=("$3"); }  # add_mount <ro|rw> <src> <dst>
 
-# pull csandbox's own flags out of the arg list; everything else goes to claude
-LIVE=1                                 # default: agent edits the checked-out tree; --worktree / CSANDBOX_WORKTREE=1 for a disposable session worktree
-[ "${CSANDBOX_WORKTREE:-0}" = 1 ] && LIVE=0
-FINDINGS="${CSANDBOX_FINDINGS:-1}"   # external memory: on by default; --no-findings / CSANDBOX_FINDINGS=0 disables
-FINDINGS_EXPLICIT=0                    # set by --findings; warn only then if the tool is missing
-TENANT="${CSANDBOX_TENANT:-}"          # --tenant <name>: a separate config dir (= separate Claude account); see the tenant block below
-EDIT_GATE="${CSANDBOX_EDIT_GATE:-0}"   # OPT-IN PreToolUse fact-forcing gate on first edits (claude-hooks/edit-gate); 1 enables. Off by default: agents were observed treating the refusal as done and moving on without the edit
+usage() {
+  cat <<'EOF'
+usage: csandbox [flags] [project-dir] [claude args...]
+       csandbox down [--tenant <name>]        stop that tenant's egress proxy
+
+Unknown arguments pass through to `claude`. Every flag has an environment
+variable default (in brackets); the variable is what hooks and subprocesses see.
+
+  --tenant <name>        second Claude account: config dir ~/.claude-sandbox-<name>,
+                         own login, proxy port and findings store   [CSANDBOX_TENANT]
+  --config-dir <dir>     explicit config dir (wins over --tenant)    [CSANDBOX_CONFIG_DIR]
+  --proxy-port <n>       this tenant's egress proxy port             [CSANDBOX_PROXY_PORT]
+  --profile <p[,p]>      egress profile(s): minimal|node|git|python|dev  [CSANDBOX_PROFILE]
+  --allow <host[,host]>  extra allowed hosts, repeatable             [CSANDBOX_EXTRA_DOMAINS]
+  --readonly             mount the workspace read-only               [CSANDBOX_READONLY=1]
+  --worktree             agent works on a disposable session worktree
+                         (default: edits the checked-out tree)       [CSANDBOX_WORKTREE=1]
+  --live                 the default; kept for muscle memory
+  --findings / --no-findings   cross-session findings memory (default on)  [CSANDBOX_FINDINGS=0]
+  --edit-gate            opt-in first-edit fact gate hook            [CSANDBOX_EDIT_GATE=1]
+  --shell                drop into bash inside the sandbox           [CSANDBOX_SHELL=1]
+  --dry-run              print the resolved config and exit          [CSANDBOX_DRYRUN=1]
+  -h, --help             this text (only as the first argument; later it goes to claude)
+
+environment-only (machine configuration):
+  CSANDBOX_ROOT          workspace root to mount (default: ~/hyper when the project is under it)
+  CSANDBOX_BACKEND       bwrap | seatbelt (default by OS)
+  CSANDBOX_FINDINGS_DIR  where the findings tool lives (default: PATH, then ~/dev/findings)
+  CSANDBOX_FINDINGS_HOME findings store override (default: ~/.findings for the default
+                         tenant, <config>/findings for a named one)
+EOF
+}
+case "${1:-}" in -h|--help) usage; exit 0 ;; esac
+
+# Pull csandbox's own flags out of the arg list; everything else goes to claude.
+# A flag just exports the environment variable it stands for, so the rest of
+# the script (and every hook/subprocess) keeps reading one source of truth.
 ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --live) LIVE=1; shift ;;                                # the default; kept for muscle memory
-    --worktree) LIVE=0; shift ;;                            # opt in to the top-level session worktree
-    --findings) FINDINGS=1; FINDINGS_EXPLICIT=1; shift ;;   # explicit on (already the default)
-    --no-findings) FINDINGS=0; shift ;;                     # opt out of the findings memory
-    --tenant) TENANT="${2:-}"; shift 2 2>/dev/null || shift ;; # run as a named tenant (own config dir + login + proxy port)
-    *)      ARGS+=("$1"); shift ;;
+    down|--down)     export CSANDBOX_DOWN=1; shift ;;
+    --tenant)        export CSANDBOX_TENANT="${2:-}"; shift 2 2>/dev/null || shift ;;
+    --config-dir)    export CSANDBOX_CONFIG_DIR="${2:-}"; shift 2 2>/dev/null || shift ;;
+    --proxy-port)    export CSANDBOX_PROXY_PORT="${2:-}"; shift 2 2>/dev/null || shift ;;
+    --profile)       export CSANDBOX_PROFILE="${2:-}"; shift 2 2>/dev/null || shift ;;
+    --allow)         export CSANDBOX_EXTRA_DOMAINS="${CSANDBOX_EXTRA_DOMAINS:+$CSANDBOX_EXTRA_DOMAINS,}${2:-}"; shift 2 2>/dev/null || shift ;;
+    --readonly)      export CSANDBOX_READONLY=1; shift ;;
+    --worktree)      export CSANDBOX_WORKTREE=1; shift ;;
+    --live)          export CSANDBOX_WORKTREE=0; shift ;;
+    --findings)      export CSANDBOX_FINDINGS=1 CSANDBOX_FINDINGS_EXPLICIT=1; shift ;;
+    --no-findings)   export CSANDBOX_FINDINGS=0; shift ;;
+    --edit-gate)     export CSANDBOX_EDIT_GATE=1; shift ;;
+    --shell)         export CSANDBOX_SHELL=1; shift ;;
+    --dry-run)       export CSANDBOX_DRYRUN=1; shift ;;
+    *)               ARGS+=("$1"); shift ;;
   esac
 done
 set -- "${ARGS[@]+"${ARGS[@]}"}"
+
+LIVE=1                                 # default: agent edits the checked-out tree
+[ "${CSANDBOX_WORKTREE:-0}" = 1 ] && LIVE=0
+FINDINGS="${CSANDBOX_FINDINGS:-1}"     # external memory: on by default
+FINDINGS_EXPLICIT="${CSANDBOX_FINDINGS_EXPLICIT:-0}"   # warn about a missing tool only when asked for explicitly
+TENANT="${CSANDBOX_TENANT:-}"
+EDIT_GATE="${CSANDBOX_EDIT_GATE:-0}"   # OPT-IN PreToolUse fact-forcing gate on first edits (claude-hooks/edit-gate). Off by default: agents were observed treating the refusal as done and moving on without the edit
 
 # --- tenant: which Claude account this run belongs to -------------------------
 # A tenant is a Claude Code config dir (CLAUDE_CONFIG_DIR). Claude Code keeps
@@ -535,7 +588,7 @@ fi
 # Each tenant has its own login (token chain lives in its config dir), rather
 # than a copy of the host credentials: OAuth refresh tokens rotate, so a seeded
 # copy dies as soon as the host client refreshes. Two ways to give a tenant one:
-#   CSANDBOX_EXTRA_DOMAINS=claude.ai csandbox [--tenant x] .   # then /login inside
+#   csandbox --allow claude.ai [--tenant x] .   # then /login inside
 #   claude setup-token > ~/.claude-sandbox-x/oauth-token         # one-year token, no login inside
 # The token file is exported as CLAUDE_CODE_OAUTH_TOKEN for that tenant only.
 # Skipped on seatbelt: macOS stores the token in the Keychain, not a
@@ -547,7 +600,7 @@ if [ -f "$CONFIG_DIR/oauth-token" ]; then
 fi
 if [ "$BACKEND" != seatbelt ] && [ ! -f "$CONFIG_DIR/.credentials.json" ] && [ -z "$TENANT_TOKEN" ]; then
   echo "csandbox: tenant '$TENANT_LABEL' has no login yet - run /login inside (needs claude.ai allowed):"
-  echo "csandbox:   CSANDBOX_EXTRA_DOMAINS=claude.ai csandbox${TENANT:+ --tenant $TENANT} ."
+  echo "csandbox:   csandbox --allow claude.ai${TENANT:+ --tenant $TENANT} ."
   echo "csandbox: or store a one-year token: claude setup-token > $CONFIG_DIR/oauth-token"
 fi
 
@@ -1106,7 +1159,7 @@ esac
 
 if [ -n "$BLOCKED" ]; then
   echo "csandbox: blocked egress this session -> $BLOCKED"
-  echo "csandbox: to allow, re-run with CSANDBOX_EXTRA_DOMAINS=$BLOCKED (or a profile)"
+  echo "csandbox: to allow, re-run with --allow $BLOCKED (or a --profile)"
 fi
 
 exit $RC
