@@ -659,11 +659,23 @@ if [ -n "$FINDINGS_DIR" ]; then
   FINDINGS_WRAPPER="$LOCAL_SHARE_DIR/findings-wrapper"
   printf '#!/bin/sh\nexec node /opt/findings/cli.js "$@"\n' > "$FINDINGS_WRAPPER"
   chmod +x "$FINDINGS_WRAPPER"
-  FINDINGS_HOME="${CSANDBOX_FINDINGS_HOME:-$HOME/.findings}"   # shared across tenants by default
+  # The store is ACCOUNT state - what one account's sessions learned must not
+  # leak into another's - so it lives with the tenant: <config>/findings for a
+  # named or explicit tenant (inside the config-dir mount, nothing extra to
+  # bind), and the pre-existing ~/.findings for the default tenant (also the
+  # host-side CLI's default, so `findings recall` on the host keeps working).
+  # CSANDBOX_FINDINGS_HOME overrides - pointing two tenants at one dir is how
+  # you share deliberately.
+  if [ -n "${CSANDBOX_FINDINGS_HOME:-}" ]; then FINDINGS_HOME="$CSANDBOX_FINDINGS_HOME"
+  elif [ "$DEFAULT_TENANT" = 1 ]; then FINDINGS_HOME="$HOME/.findings"
+  else FINDINGS_HOME="$CONFIG_DIR/findings"; fi
   mkdir -p "$FINDINGS_HOME"
   add_mount ro "$FINDINGS_DIR" /opt/findings
   add_mount ro "$FINDINGS_WRAPPER" "$BIN_IN/findings"
-  add_mount rw "$FINDINGS_HOME" "$FINDINGS_HOME"   # rw: shared store + telemetry trace (same path inside)
+  case "$FINDINGS_HOME" in
+    "$CONFIG_DIR"/*) ;;                                    # already inside the config-dir mount
+    *) add_mount rw "$FINDINGS_HOME" "$FINDINGS_HOME" ;;  # rw: store + telemetry trace (same path inside)
+  esac
   FINDINGS_EVENTS="$FINDINGS_HOME/events.jsonl"
   # Hook scripts (claude-hooks/): copied to the host-side share dir and mounted
   # on PATH. Under bwrap they are reached at $BIN_IN/<name>; seatbelt applies no
@@ -910,7 +922,7 @@ echo "csandbox: backend $BACKEND, tenant '$TENANT_LABEL' -> $CONFIG_DIR (proxy :
 echo "csandbox: mount $ROOT ($MOUNT_NOTE), $SCRUB_COUNT secret file(s) shadowed"
 echo "csandbox: egress allowlist -> $ALLOWED_DOMAINS"
 [ -n "$LINKER_DIR" ] && echo "csandbox: linker -> $LINKER_DIR (declarative local links wired per-worktree)"
-[ -n "$FINDINGS_DIR" ] && echo "csandbox: findings -> $FINDINGS_DIR (external memory at ~/.findings, telemetry on; --no-findings to disable)"
+[ -n "$FINDINGS_DIR" ] && echo "csandbox: findings -> $FINDINGS_DIR (store $FINDINGS_HOME, telemetry on; --no-findings to disable)"
 if [ "$LIVE" = 1 ]; then echo "csandbox: agent edits the working tree directly (--worktree for a disposable session branch)"; else echo "csandbox: --worktree -> agent works on a disposable session worktree"; fi
 
 # dry run: show resolved config and stop before launching the backend

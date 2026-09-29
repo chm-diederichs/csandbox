@@ -21,8 +21,11 @@ The metric that matters is **not tokens** (those favor this) but **miss-rate**
 
 ## Built: what exists today (2026-09-23)
 
-- **Store + CLI** (`~/dev/findings`): one SQLite file at `~/.findings/findings.db`
-  with FTS5, verbs `record` (dedup-at-write: warns on near-duplicate claims and
+- **Store + CLI** (`~/dev/findings`): one SQLite file with FTS5 - at
+  `~/.findings/findings.db` for the default csandbox tenant (also the host CLI's
+  default), `<config>/findings/findings.db` for a named tenant, since what one
+  account's sessions learned is account state and must not leak into another's
+  (`CSANDBOX_FINDINGS_HOME` to share deliberately) - verbs `record` (dedup-at-write: warns on near-duplicate claims and
   suggests `--supersedes`), `recall` (filter + BM25, two-stage), `show`,
   `supersede`, `list`, `repos`, `stats`. Telemetry: every command appends to
   `~/.findings/events.jsonl` (`stats` summarises it).

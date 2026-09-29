@@ -130,7 +130,7 @@ profiles trade some of that for convenience.
 | `CSANDBOX_TENANT=<name>` | Run as a named tenant: config dir `~/.claude-sandbox-<name>`, its own login and egress proxy port (`--tenant <name>` does the same). |
 | `CSANDBOX_CONFIG_DIR`    | Explicit config dir for this run (wins over the tenant name). Set `CSANDBOX_PROXY_PORT` with it. |
 | `CSANDBOX_PROXY_PORT`    | Loopback port for this tenant's egress proxy. Default tenant: 8888; named tenants are allocated one from the range `bwrap-setup` opened. |
-| `CSANDBOX_FINDINGS_HOME` | Findings store dir (default `~/.findings`, shared by every tenant). |
+| `CSANDBOX_FINDINGS_HOME` | Findings store dir. Default: `~/.findings` for the default tenant, `<config>/findings` for a named one - per account, never shared unless you point two tenants at one dir. |
 | `CSANDBOX_WORKTREE=1`    | Agent works on a disposable session worktree instead of your tree (`--worktree` does the same). |
 | `CSANDBOX_EDIT_GATE=1`   | Enable the opt-in edit gate hook: the first edit to an existing source file is refused once with a fact request (importers, exports, formats). Off by default. |
 | `CSANDBOX_FINDINGS=0`    | Disable the findings memory for this run (`--no-findings` does the same).                |
@@ -252,8 +252,9 @@ On by default (`--no-findings` / `CSANDBOX_FINDINGS=0` to opt out) when the
 queryable SQLite store of distilled claims (`observation` / `decision` /
 `memory`) that lets sessions stay short and ephemeral instead of carrying one
 long, lossily-compacted transcript. Like linker it is mounted, not baked: the
-CLI at `/opt/findings`, a wrapper on `PATH`, and `~/.findings` read-write so
-every session reads and writes one store. Findings are keyed by repo (the main
+CLI at `/opt/findings`, a wrapper on `PATH`, and the tenant's store read-write
+(`~/.findings` for the default tenant, `<config>/findings` for a named one) so
+every session of that account reads and writes one store. Findings are keyed by repo (the main
 worktree, however many linked worktrees recorded them), and observations flag
 "verify" when their files changed since they were recorded.
 
@@ -272,8 +273,12 @@ Claude Code draws around an account: with `CLAUDE_CONFIG_DIR` set it keeps the
 OAuth login, the account/org ids, settings, sessions and the cached
 server-managed org policy under that dir, and under bwrap the host `~/.claude`
 is not mounted at all, so tenants can't see each other. Everything else is per
-user and shared: the workspace mount, the systemd slice and nft rule, the wrapper
-scripts, and the findings store (`CSANDBOX_FINDINGS_HOME` to split it).
+user and shared: the workspace mount, the systemd slice and nft rule, and the
+wrapper scripts. The **findings store is per tenant** - it is what an account's
+sessions learned, so it lives in `<config>/findings` for a named tenant (the
+default tenant keeps the pre-existing `~/.findings`, which is also the host CLI's
+default). Set `CSANDBOX_FINDINGS_HOME` on two tenants to the same dir if you
+want them to share deliberately.
 
 ```bash
 csandbox --tenant work .                                  # ~/.claude-sandbox-work
