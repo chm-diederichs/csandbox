@@ -101,6 +101,7 @@ next time.
 | `python`  | `pypi.org`, `files.pythonhosted.org`                                                      |
 | `dev`     | `node` + `git` + `python` (general coding with installs)                                  |
 | `login`   | `claude.ai`, for the `/login` browser flow - a tenant's first run only                    |
+| `open`    | every hostname, through the proxy. TCP only: UDP/P2P (Hyperswarm, QUIC) still can't leave the slice - see Limitations |
 
 Profiles combine: `--profile node,git`.
 
@@ -116,6 +117,12 @@ Fastly) that a hostname-only proxy cannot make front-proof, so they are opt-in p
 workflow rather than always-on. `minimal` is genuinely fronting-resistant; broader
 profiles trade some of that for convenience.
 
+`open` drops hostname filtering altogether (the launch line says so loudly): use
+it for a one-off that needs arbitrary HTTPS hosts. It is still **TCP through the
+proxy** - a UDP or holepunched P2P socket has no hostname to allow and never
+reaches the proxy, so Hyperswarm-style traffic needs the unbuilt wide route
+described under Limitations, not a profile.
+
 ---
 
 ## Flags and environment variables
@@ -128,7 +135,7 @@ prints the same table.
 
 | Flag                      | Env var                   | Effect                                                                                  |
 | ------------------------- | ------------------------- | --------------------------------------------------------------------------------------- |
-| `--profile <p[,p]>`       | `CSANDBOX_PROFILE`        | Egress profile(s). Default `minimal` (`node` / `git` / `python` / `dev` / `login`).               |
+| `--profile <p[,p]>`       | `CSANDBOX_PROFILE`        | Egress profile(s). Default `minimal` (`node` / `git` / `python` / `dev` / `login` / `open`).               |
 | `--allow <host[,host]>`   | `CSANDBOX_EXTRA_DOMAINS`  | Extra hosts to allow on top of the profile(s); repeatable.                              |
 | `--root <dir>`            | `CSANDBOX_ROOT`           | Workspace root to mount; **remembered per tenant** in `<config>/root` and applied to every later run of that tenant (delete the file to forget). Default: `~/hyper` when the project is under it, else the project dir. A run started outside the root with no project dir lands at the root. |
 | `--readonly`              | `CSANDBOX_READONLY=1`     | Mount the workspace read-only.                                                          |

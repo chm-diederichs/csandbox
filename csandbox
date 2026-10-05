@@ -166,7 +166,7 @@ variable default (in brackets); the variable is what hooks and subprocesses see.
                          own login, proxy port and findings store   [CSANDBOX_TENANT]
   --config-dir <dir>     explicit config dir (wins over --tenant)    [CSANDBOX_CONFIG_DIR]
   --proxy-port <n>       this tenant's egress proxy port             [CSANDBOX_PROXY_PORT]
-  --profile <p[,p]>      egress profile(s): minimal|node|git|python|dev|login  [CSANDBOX_PROFILE]
+  --profile <p[,p]>      egress profile(s): minimal|node|git|python|dev|login|open  [CSANDBOX_PROFILE]
   --allow <host[,host]>  extra allowed hosts, repeatable             [CSANDBOX_EXTRA_DOMAINS]
   --root <dir>           workspace root to mount; remembered per tenant in
                          <config>/root (delete the file to forget)   [CSANDBOX_ROOT]
@@ -901,6 +901,7 @@ profile_domains() {
     git)     echo "github.com codeload.github.com raw.githubusercontent.com objects.githubusercontent.com gist.githubusercontent.com" ;;
     python)  echo "pypi.org files.pythonhosted.org" ;;
     login)   echo "claude.ai" ;;   # the /login browser flow; only needed for a tenant's first run
+    open)    echo "*" ;;           # every hostname through the proxy (TCP only - UDP/P2P still can't leave the slice)
     dev)     echo "$(profile_domains node) $(profile_domains git) $(profile_domains python)" ;;
     *)       echo "__UNKNOWN__:$1" ;;
   esac
@@ -914,13 +915,17 @@ IFS=',' read -ra PROFILES <<< "${CSANDBOX_PROFILE:-minimal}"
 for p in "${PROFILES[@]}"; do
   p="$(echo "$p" | tr -d '[:space:]')"
   [ -z "$p" ] && continue
+  # noglob for the whole loop: the `open` profile's "*" must stay a literal
+  # through word-splitting, not expand to the cwd listing
+  set -f
   for d in $(profile_domains "$p"); do
     if [[ "$d" == __UNKNOWN__:* ]]; then
-      echo "error: unknown profile '${d#__UNKNOWN__:}' (valid: minimal node git python dev login)" >&2
+      echo "error: unknown profile '${d#__UNKNOWN__:}' (valid: minimal node git python dev login open)" >&2
       exit 1
     fi
     DOMAIN_SET+=("$d")
   done
+  set +f
 done
 if [ -n "${CSANDBOX_EXTRA_DOMAINS:-}" ]; then
   IFS=',' read -ra EXTRA <<< "$CSANDBOX_EXTRA_DOMAINS"
@@ -997,7 +1002,11 @@ fi
 # --- launch -------------------------------------------------------------
 echo "csandbox: backend $BACKEND, tenant '$TENANT_LABEL' -> $CONFIG_DIR (proxy :$PROXY_PORT)"
 echo "csandbox: mount $ROOT ($MOUNT_NOTE), $SCRUB_COUNT secret file(s) shadowed"
-echo "csandbox: egress allowlist -> $ALLOWED_DOMAINS"
+if [[ ",$ALLOWED_DOMAINS," == *",*,"* ]]; then
+  echo "csandbox: egress OPEN - the proxy admits every hostname this session (TCP via CONNECT/HTTP only; UDP/P2P still blocked by the slice rule)"
+else
+  echo "csandbox: egress allowlist -> $ALLOWED_DOMAINS"
+fi
 [ -n "$LINKER_DIR" ] && echo "csandbox: linker -> $LINKER_DIR (declarative local links wired per-worktree)"
 [ -n "$FINDINGS_DIR" ] && echo "csandbox: findings -> $FINDINGS_DIR (store $FINDINGS_HOME, telemetry on; --no-findings to disable)"
 if [ "$LIVE" = 1 ]; then echo "csandbox: agent edits the working tree directly (--worktree for a disposable session branch)"; else echo "csandbox: --worktree -> agent works on a disposable session worktree"; fi

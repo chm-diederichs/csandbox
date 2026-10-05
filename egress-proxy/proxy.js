@@ -19,7 +19,12 @@ if (allowlist.length === 0) {
   process.exit(1);
 }
 
+// '*' in the allowlist (the `open` profile) admits every hostname. Still only
+// TCP through CONNECT/HTTP - UDP/P2P never reaches the proxy at all.
+const OPEN = allowlist.includes('*');
+
 function isAllowed(host) {
+  if (OPEN) return true;
   const h = host.toLowerCase();
   return allowlist.some((domain) => h === domain || h.endsWith('.' + domain));
 }
@@ -93,5 +98,5 @@ server.on('connect', (req, clientSocket, head) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`[egress-proxy] listening on :${PORT}, allowlist: ${allowlist.join(', ')}`);
+  console.log(`[egress-proxy] listening on :${PORT}, allowlist: ${OPEN ? 'OPEN (every host)' : allowlist.join(', ')}`);
 });
