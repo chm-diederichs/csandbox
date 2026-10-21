@@ -1064,8 +1064,14 @@ launch_bwrap() {
   # node/npm + the claude CLI live under $HOME (nvm / ~/.local), not /usr -
   # bind just those, read-only (mount-not-bake, same spirit as linker/findings
   # above). This is what lets the bwrap path skip a build step entirely.
+  # The whole node prefix, not just bin/: npm itself and every global's bin
+  # entry are symlinks into <prefix>/lib/node_modules. Globals that are
+  # `npm link`s resolve only if their target is mounted too (e.g. under --root).
   local node_bin_dir; node_bin_dir="$(dirname "$(resolve "$(command -v node)")")"
-  bw+=(--ro-bind "$node_bin_dir" "$node_bin_dir")
+  local node_prefix; node_prefix="$(dirname "$node_bin_dir")"
+  bw+=(--ro-bind "$node_prefix" "$node_prefix")
+  # a prefix-level global npmrc can carry registry tokens - shadow it
+  [ -f "$node_prefix/etc/npmrc" ] && bw+=(--ro-bind /dev/null "$node_prefix/etc/npmrc")
   bw+=(--ro-bind-try "$HOME/.local/bin" "$HOME/.local/bin")
   bw+=(--ro-bind-try "$HOME/.local/share/claude" "$HOME/.local/share/claude")
 
