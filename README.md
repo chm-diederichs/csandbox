@@ -101,7 +101,7 @@ next time.
 | `python`  | `pypi.org`, `files.pythonhosted.org`                                                      |
 | `dev`     | `node` + `git` + `python` (general coding with installs)                                  |
 | `login`   | `claude.ai`, for the `/login` browser flow - a tenant's first run only                    |
-| `open`    | every hostname, through the proxy. TCP only: UDP/P2P (Hyperswarm, QUIC) still can't leave the slice - see Limitations |
+| `open`    | every hostname, through the proxy. TCP only: UDP/P2P (Hyperswarm, QUIC) is a separate switch - see `--udp` below |
 
 Profiles combine: `--profile node,git`.
 
@@ -120,8 +120,27 @@ profiles trade some of that for convenience.
 `open` drops hostname filtering altogether (the launch line says so loudly): use
 it for a one-off that needs arbitrary HTTPS hosts. It is still **TCP through the
 proxy** - a UDP or holepunched P2P socket has no hostname to allow and never
-reaches the proxy, so Hyperswarm-style traffic needs the unbuilt wide route
-described under Limitations, not a profile.
+reaches the proxy, so Hyperswarm-style traffic needs `--udp`, not a profile.
+
+### UDP (`--udp local|open`, bwrap only)
+
+UDP is blocked by default and no profile changes that. `--udp` launches the
+session into a child slice of `csandbox.slice` that has one extra nft accept;
+every TCP restriction still applies.
+
+| Mode    | Allows                                                                 | Use for |
+| ------- | ---------------------------------------------------------------------- | ------- |
+| `local` | UDP to loopback (`127.0.0.0/8`, `::1`) except port 53, so the resolver stub can't be used to tunnel out through DNS | local DHT testnets, brittle tests |
+| `open`  | all outbound UDP - **bypasses the proxy and the hostname allowlist**   | joining a real swarm, holepunching |
+
+```bash
+csandbox --udp local .     # testnets on localhost; nothing leaves the machine
+csandbox --udp open .      # real P2P; the launch line warns
+```
+
+The slices and rules come from `bwrap-setup`; csandbox refuses `--udp` until it
+has been re-run since this was added. Dropped UDP never reaches the proxy, so it
+is not in the blocked-hosts report on exit.
 
 ---
 
@@ -137,6 +156,7 @@ prints the same table.
 | ------------------------- | ------------------------- | --------------------------------------------------------------------------------------- |
 | `--profile <p[,p]>`       | `CSANDBOX_PROFILE`        | Egress profile(s). Default `minimal` (`node` / `git` / `python` / `dev` / `login` / `open`).               |
 | `--allow <host[,host]>`   | `CSANDBOX_EXTRA_DOMAINS`  | Extra hosts to allow on top of the profile(s); repeatable.                              |
+| `--udp <local\|open>`     | `CSANDBOX_UDP`            | Allow UDP: `local` = loopback minus DNS, `open` = all outbound. bwrap only.             |
 | `--root <dir>`            | `CSANDBOX_ROOT`           | Workspace root to mount; **remembered per tenant** in `<config>/root` and applied to every later run of that tenant (delete the file to forget). Default: `~/hyper` when the project is under it, else the project dir. A run started outside the root with no project dir lands at the root. |
 | `--readonly`              | `CSANDBOX_READONLY=1`     | Mount the workspace read-only.                                                          |
 | `--worktree`              | `CSANDBOX_WORKTREE=1`     | Agent works on a disposable session worktree instead of your tree. `--live` is the default. |
@@ -411,12 +431,9 @@ inside.
   inner Host/path — **not built here**; add it if your threat model needs defense
   against a genuinely adversarial in-sandbox process.
 
-- **No `--open-egress` yet.** UDP/P2P traffic (Hyperswarm holepunch, QUIC, …) has
-  no hostname to allowlist, so the HTTP `CONNECT` proxy can't serve it at all — it
-  needs a genuinely wider network route for the session. That existed under the
-  old docker backend; it hasn't been rebuilt for bwrap yet (would need a second
-  pre-provisioned systemd slice + accept-all nft rule). Follow-up work, not
-  currently available.
+- **`--udp open` is unfiltered.** UDP has no hostname to allowlist, so open mode
+  lets the session send UDP anywhere, including DNS. Prefer `--udp local` when
+  the peers are on this machine. Not available on the seatbelt (macOS) backend.
 
 - **API quota.** The sandbox login lets the sandboxed agent spend your Anthropic
   quota — inherent to it being able to run Claude at all.

@@ -42,6 +42,19 @@
 #    system.slice are real units, keeps it from being garbage-collected
 #    between sessions, so the one nft rule loaded now keeps matching for good.
 #
+# 3. UDP opt-ins (`csandbox --udp local|open`): two more persistent slices
+#    NESTED under csandbox.slice (systemd's dash naming: csandbox-udplocal.slice
+#    lives at .../csandbox.slice/csandbox-udplocal.slice), each with one extra
+#    nft accept placed before csandbox.slice's drop. Sessions in them inherit
+#    every TCP restriction above (the level-4 rules match descendants too):
+#      udplocal - UDP to loopback only (127.0.0.0/8, ::1), minus port 53 so the
+#                 systemd-resolved stub (127.0.0.53) can't be used to tunnel
+#                 out through DNS. Enough for local DHT testnets.
+#      udpopen  - all outbound UDP. Bypasses the hostname allowlist entirely
+#                 (UDP never touches the proxy) - swarming / holepunching.
+#    Recorded in /etc/csandbox/udp so the launcher can refuse a mode whose
+#    rule isn't loaded.
+#
 # Safe to re-run any time; every step replaces its prior state rather than
 # layering on top of it.
 set -euo pipefail
@@ -93,9 +106,18 @@ cat > "$SLICE_UNIT" <<'EOF'
 Description=csandbox sandboxed sessions (persistent, so the csandbox nft egress rule keeps matching a stable cgroup)
 Before=shutdown.target
 EOF
+# the --udp opt-in slices: children of csandbox.slice by name, persistent for
+# the same stable-cgroup reason
+for _m in udplocal udpopen; do
+  cat > "/etc/systemd/user/csandbox-$_m.slice" <<EOF
+[Unit]
+Description=csandbox sessions launched with --udp ${_m#udp} (persistent, so its nft UDP rule keeps matching)
+Before=shutdown.target
+EOF
+done
 as_user systemctl --user daemon-reload
-as_user systemctl --user start csandbox.slice
-echo "bwrap-setup: persistent user slice installed and started ($SLICE_UNIT)"
+as_user systemctl --user start csandbox.slice csandbox-udplocal.slice csandbox-udpopen.slice
+echo "bwrap-setup: persistent user slices installed and started ($SLICE_UNIT + csandbox-udplocal/udpopen)"
 
 # --- 3. nft ------------------------------------------------------------------
 # nft's "cgroupv2 path" match needs the FULL path from the cgroupfs root (not
@@ -105,18 +127,24 @@ echo "bwrap-setup: persistent user slice installed and started ($SLICE_UNIT)"
 # level-4 match string has to be the whole thing.
 CGROUP_PATH="user.slice/user-${REAL_UID}.slice/user@${REAL_UID}.service/csandbox.slice"
 CGROUP_LEVEL=4
+UDP_LEVEL=5   # the --udp slices sit one level below csandbox.slice
 nft delete table inet csandbox 2>/dev/null || true
 nft -f - <<EOF
 table inet csandbox {
   chain output {
     type filter hook output priority filter; policy accept;
     socket cgroupv2 level ${CGROUP_LEVEL} "${CGROUP_PATH}" tcp dport ${PORT_MIN}-${PORT_MAX} ip daddr 127.0.0.1 accept
+    socket cgroupv2 level ${UDP_LEVEL} "${CGROUP_PATH}/csandbox-udplocal.slice" udp dport 53 drop
+    socket cgroupv2 level ${UDP_LEVEL} "${CGROUP_PATH}/csandbox-udplocal.slice" ip daddr 127.0.0.0/8 meta l4proto udp accept
+    socket cgroupv2 level ${UDP_LEVEL} "${CGROUP_PATH}/csandbox-udplocal.slice" ip6 daddr ::1 meta l4proto udp accept
+    socket cgroupv2 level ${UDP_LEVEL} "${CGROUP_PATH}/csandbox-udpopen.slice" meta l4proto udp accept
     socket cgroupv2 level ${CGROUP_LEVEL} "${CGROUP_PATH}" drop
   }
 }
 EOF
 mkdir -p /etc/csandbox
 echo "$PORT_MIN $PORT_MAX" > /etc/csandbox/proxy-ports
-echo "bwrap-setup: nft table 'inet csandbox' installed - csandbox.slice egress restricted to 127.0.0.1:${PORT_MIN}-${PORT_MAX} (range recorded in /etc/csandbox/proxy-ports)"
+echo "local open" > /etc/csandbox/udp
+echo "bwrap-setup: nft table 'inet csandbox' installed - csandbox.slice egress restricted to 127.0.0.1:${PORT_MIN}-${PORT_MAX} (range recorded in /etc/csandbox/proxy-ports); --udp local|open rules loaded (/etc/csandbox/udp)"
 
 echo "bwrap-setup: done."

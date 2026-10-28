@@ -168,6 +168,9 @@ variable default (in brackets); the variable is what hooks and subprocesses see.
   --proxy-port <n>       this tenant's egress proxy port             [CSANDBOX_PROXY_PORT]
   --profile <p[,p]>      egress profile(s): minimal|node|git|python|dev|login|open  [CSANDBOX_PROFILE]
   --allow <host[,host]>  extra allowed hosts, repeatable             [CSANDBOX_EXTRA_DOMAINS]
+  --udp <local|open>     allow UDP (bwrap only): local = loopback, no DNS
+                         (DHT testnets); open = all outbound UDP, bypasses
+                         the allowlist (real swarming)                [CSANDBOX_UDP]
   --root <dir>           workspace root to mount; remembered per tenant in
                          <config>/root (delete the file to forget)   [CSANDBOX_ROOT]
   --readonly             mount the workspace read-only               [CSANDBOX_READONLY=1]
@@ -202,6 +205,7 @@ while [ $# -gt 0 ]; do
     --profile)       export CSANDBOX_PROFILE="${2:-}"; shift 2 2>/dev/null || shift ;;
     --allow)         export CSANDBOX_EXTRA_DOMAINS="${CSANDBOX_EXTRA_DOMAINS:+$CSANDBOX_EXTRA_DOMAINS,}${2:-}"; shift 2 2>/dev/null || shift ;;
     --root)          export CSANDBOX_ROOT="${2:-}" CSANDBOX_ROOT_SAVE=1; shift 2 2>/dev/null || shift ;;
+    --udp)           export CSANDBOX_UDP="${2:-}"; shift 2 2>/dev/null || shift ;;
     --readonly)      export CSANDBOX_READONLY=1; shift ;;
     --worktree)      export CSANDBOX_WORKTREE=1; shift ;;
     --live)          export CSANDBOX_WORKTREE=0; shift ;;
@@ -220,6 +224,21 @@ LIVE=1                                 # default: agent edits the checked-out tr
 FINDINGS="${CSANDBOX_FINDINGS:-1}"     # external memory: on by default
 FINDINGS_EXPLICIT="${CSANDBOX_FINDINGS_EXPLICIT:-0}"   # warn about a missing tool only when asked for explicitly
 TENANT="${CSANDBOX_TENANT:-}"
+UDP="${CSANDBOX_UDP:-}"                # UDP opt-in: "" (blocked) | local | open
+case "$UDP" in
+  ""|off) UDP="" ;;
+  local|open)
+    if [ "$BACKEND" != bwrap ]; then
+      echo "csandbox: --udp is bwrap-only (the $BACKEND backend has no UDP switch)" >&2; exit 1
+    fi
+    # the slice + nft rule come from the one-time root setup; refuse rather
+    # than launch into a slice no rule matches (it would just inherit the drop)
+    UDP_FILE="${CSANDBOX_UDP_FILE:-/etc/csandbox/udp}"
+    if ! grep -qw "$UDP" "$UDP_FILE" 2>/dev/null; then
+      echo "csandbox: --udp $UDP needs its firewall rule - re-run: sudo $SANDBOX_DIR/bwrap-setup" >&2; exit 1
+    fi ;;
+  *) echo "csandbox: --udp must be local or open, got '$UDP'" >&2; exit 1 ;;
+esac
 EDIT_GATE="${CSANDBOX_EDIT_GATE:-0}"   # OPT-IN PreToolUse fact-forcing gate on first edits (claude-hooks/edit-gate). Off by default: agents were observed treating the refusal as done and moving on without the edit
 
 # --- tenant: which Claude account this run belongs to -------------------------
@@ -1003,10 +1022,14 @@ fi
 echo "csandbox: backend $BACKEND, tenant '$TENANT_LABEL' -> $CONFIG_DIR (proxy :$PROXY_PORT)"
 echo "csandbox: mount $ROOT ($MOUNT_NOTE), $SCRUB_COUNT secret file(s) shadowed"
 if [[ ",$ALLOWED_DOMAINS," == *",*,"* ]]; then
-  echo "csandbox: egress OPEN - the proxy admits every hostname this session (TCP via CONNECT/HTTP only; UDP/P2P still blocked by the slice rule)"
+  echo "csandbox: egress OPEN - the proxy admits every hostname this session (TCP via CONNECT/HTTP only; UDP is separate, see --udp)"
 else
   echo "csandbox: egress allowlist -> $ALLOWED_DOMAINS"
 fi
+case "$UDP" in
+  local) echo "csandbox: UDP local - loopback only, DNS (port 53) still blocked" ;;
+  open)  echo "csandbox: UDP OPEN - all outbound UDP allowed; it bypasses the proxy and the hostname allowlist" ;;
+esac
 [ -n "$LINKER_DIR" ] && echo "csandbox: linker -> $LINKER_DIR (declarative local links wired per-worktree)"
 [ -n "$FINDINGS_DIR" ] && echo "csandbox: findings -> $FINDINGS_DIR (store $FINDINGS_HOME, telemetry on; --no-findings to disable)"
 if [ "$LIVE" = 1 ]; then echo "csandbox: agent edits the working tree directly (--worktree for a disposable session branch)"; else echo "csandbox: --worktree -> agent works on a disposable session worktree"; fi
@@ -1109,7 +1132,9 @@ launch_bwrap() {
   # the sandboxed process stays in the host's real network namespace, but
   # can't reach anything the nft rule doesn't allow.
   set +e
-  systemd-run --user --scope --quiet --slice=csandbox \
+  local slice=csandbox
+  [ -n "$UDP" ] && slice="csandbox-udp$UDP"   # nested under csandbox.slice; see bwrap-setup
+  systemd-run --user --scope --quiet --slice="$slice" \
     -p MemoryMax=16G -p TasksMax=8192 \
     --unit "csandbox-${SESSION_ID:-run}-$$" \
     -- bwrap "${bw[@]}" -- "${CMD[@]}"
