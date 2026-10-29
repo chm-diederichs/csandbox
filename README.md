@@ -25,7 +25,6 @@ csandbox                       # sandbox the current directory (minimal egress)
 csandbox ~/code/myapp          # sandbox a specific project
 csandbox . --continue          # unknown args are passed to `claude`
 csandbox --profile dev .       # allow npm + git + pypi for this session
-csandbox --worktree .          # agent works on a disposable branch instead of your tree (see below)
 csandbox --tenant work .       # a second Claude account: own config dir, login, proxy port, findings (see below)
 csandbox --help                # every flag, and the env var each one defaults from
 ```
@@ -159,7 +158,6 @@ prints the same table.
 | `--udp <local\|open>`     | `CSANDBOX_UDP`            | Allow UDP: `local` = loopback minus DNS, `open` = all outbound. bwrap only.             |
 | `--root <dir>`            | `CSANDBOX_ROOT`           | Workspace root to mount; **remembered per tenant** in `<config>/root` and applied to every later run of that tenant (delete the file to forget). Default: `~/hyper` when the project is under it, else the project dir. A run started outside the root with no project dir lands at the root. |
 | `--readonly`              | `CSANDBOX_READONLY=1`     | Mount the workspace read-only.                                                          |
-| `--worktree`              | `CSANDBOX_WORKTREE=1`     | Agent works on a disposable session worktree instead of your tree. `--live` is the default. |
 | `--tenant <name>`         | `CSANDBOX_TENANT`         | Second Claude account: config dir `~/.claude-sandbox-<name>`, own login, proxy port and findings store. |
 | `--config-dir <dir>`      | `CSANDBOX_CONFIG_DIR`     | Explicit config dir (wins over the tenant name). Pair with `--proxy-port`.              |
 | `--proxy-port <n>`        | `CSANDBOX_PROXY_PORT`     | This tenant's egress proxy port. Default tenant 8888; named tenants are allocated one from the range `bwrap-setup` opened. |
@@ -220,26 +218,14 @@ Code's hardcoded self-config approval prompt (it survives even
 
 ---
 
-## Top-level session worktree
+## Worktrees
 
-By default the agent works **directly in your checked-out tree, on the current
-branch**, and commits there when done. The seeded `CLAUDE.md` tells it not to
-create branches or worktrees unless you ask for one in the conversation.
-
-Pass **`--worktree`** (or `CSANDBOX_WORKTREE=1`) when you are hacking in the
-same repo concurrently and want the agent's edits kept off your tree: it then
-calls `EnterWorktree` at session start, so its work lands on a disposable branch
-off the current commit (`worktree.baseRef: "head"`), and it leaves that branch
-for you to review and merge (it won't push, PR, or merge). A worktree carries
-committed history only, not your uncommitted changes.
-
-Either way, any worktree the agent creates by hand goes under
-`<repo>/.claude/worktrees/<name>`, never as a sibling directory of the repo.
-
-```bash
-csandbox .              # default: agent edits your checked-out working tree
-csandbox --worktree .   # agent works on its own throwaway branch
-```
+csandbox has no worktree rule of its own: the agent works in your checked-out
+tree and follows Claude Code's stock worktree behavior, creating one only when
+you ask. `--worktree` is not a csandbox flag: put it after the project dir
+(`csandbox . --worktree`) and it reaches Claude Code's own `--worktree`.
+Before the dir it would swallow the dir as the worktree's name. When the agent does call `EnterWorktree`, the seeded
+`worktree.baseRef: "head"` branches it from the current commit.
 
 ---
 
@@ -355,7 +341,8 @@ stored login. Note that server-managed org policy is per account, so two
 tenants in different organizations can behave differently (e.g. bypass mode).
 
 Two tenants running concurrently in the same repo edit the same working tree by
-default; use `--worktree` for concurrent runs.
+default; ask for a worktree (or run `csandbox . --worktree`) for concurrent
+runs.
 
 ## Skills and rules
 
