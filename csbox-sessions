@@ -1,0 +1,382 @@
+#!/usr/bin/env python3
+"""csbox-sessions - a searchable index over Claude Code session transcripts.
+
+The index is a DERIVED CACHE. Transcripts are the source of truth, so `rebuild`
+can always regenerate it and there is no sync-bug class to maintain. Only two
+columns are durable (never touched by rebuild): `protected` and `note`.
+
+Sessions bucket by escaped-cwd under <config>/projects/, so the built-in
+--resume picker only ever sees the bucket you relaunched from - that is the
+"lost sessions" problem. This indexes every bucket across every config dir
+(host + each csandbox tenant) into one list.
+
+  csbox-sessions rebuild            rescan transcripts (incremental by mtime)
+  csbox-sessions list [-a] [query]  print the index (tab-separated)
+                                    (list/pick/resume auto-refresh; --no-rebuild skips)
+  csbox-sessions pick [query]       fzf picker -> prints the chosen session id
+        --fields                    print 'id<TAB>cwd' instead of just the id
+        --config-dir DIR            only sessions from that config dir
+        --under DIR                 only sessions whose cwd is inside DIR
+        --near DIR                  rank DIR's repo first (does not filter)
+        --allow-new [--new-cwd DIR] offer '+ new session' as the first entry
+  csbox-sessions resume [query]     pick, then exec `claude --resume <id>`
+  csbox-sessions protect <id>...    mark keep-forever (also pins it in --all)
+  csbox-sessions unprotect <id>...
+  csbox-sessions note <id> <text>   annotate a session (durable, searchable)
+  csbox-sessions gc [--apply]       delete worthless transcripts (dry-run default)
+
+Env:
+  CSBOX_SESSION_DB    index location (default ~/.local/share/csandbox/sessions.db)
+  CSBOX_CONFIG_DIRS   colon-separated config dirs to scan
+                      (default: ~/.claude plus ~/.claude-sandbox*)
+"""
+import json, os, sqlite3, subprocess, sys, glob, shutil
+
+HOME = os.path.expanduser('~')
+DB = os.environ.get('CSBOX_SESSION_DB', os.path.join(HOME, '.local/share/csandbox/sessions.db'))
+
+def config_dirs():
+    env = os.environ.get('CSBOX_CONFIG_DIRS')
+    if env:
+        return [d for d in env.split(':') if d]
+    dirs = [os.path.join(HOME, '.claude')]
+    dirs += sorted(glob.glob(os.path.join(HOME, '.claude-sandbox*')))
+    return [d for d in dirs if os.path.isdir(os.path.join(d, 'projects'))]
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS session (
+  id           TEXT PRIMARY KEY,
+  path         TEXT,     -- transcript file (what makes it resumable)
+  config_dir   TEXT,
+  started      TEXT,
+  ended        TEXT,
+  title        TEXT,     -- Claude Code's own ai-title, free
+  first_prompt TEXT,
+  last_prompt  TEXT,
+  cwd          TEXT,     -- last cwd seen; where a resume should land
+  repos        TEXT,     -- distinct git roots touched, comma-joined
+  branches     TEXT,
+  messages     INTEGER,  -- user+assistant records
+  commits      INTEGER,  -- `git commit` tool_use count
+  compacted    INTEGER DEFAULT 0,
+  mtime        REAL,     -- incremental-rebuild key
+  size         INTEGER,
+  -- durable: rebuild never writes these
+  protected    INTEGER DEFAULT 0,
+  note         TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS session_ended ON session(ended DESC);
+"""
+
+def db():
+    os.makedirs(os.path.dirname(DB), exist_ok=True)
+    c = sqlite3.connect(DB)
+    c.executescript(SCHEMA)
+    have = {r[1] for r in c.execute('PRAGMA table_info(session)')}
+    for col, decl in (('cwd', 'TEXT'),):          # migrate an index built before this column
+        if col not in have:
+            c.execute(f'ALTER TABLE session ADD COLUMN {col} {decl}')
+    return c
+
+def git_root(path, _cache={}):
+    """Map a cwd to its main worktree, so a repo and its worktrees collapse."""
+    if path in _cache:
+        return _cache[path]
+    root = path
+    try:
+        r = subprocess.run(['git', '-C', path, 'rev-parse', '--path-format=absolute',
+                            '--git-common-dir'], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            gcd = r.stdout.strip()
+            if gcd.endswith('/.git'):
+                root = gcd[:-5]
+            elif os.path.basename(gcd) == '.git':
+                root = os.path.dirname(gcd)
+    except Exception:
+        pass
+    _cache[path] = root
+    return root
+
+def text_of(msg):
+    c = msg.get('content')
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return ' '.join(x.get('text', '') for x in c
+                        if isinstance(x, dict) and x.get('type') == 'text')
+    return ''
+
+def scan(path):
+    """Derive every non-durable field from one transcript."""
+    started = ended = title = first_prompt = last_prompt = last_cwd = None
+    cwds, branches = set(), set()
+    messages = commits = 0
+    compacted = False
+    with open(path, errors='replace') as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            t = d.get('type')
+            if d.get('timestamp'):
+                started = started or d['timestamp']
+                ended = d['timestamp']
+            if d.get('cwd'):
+                cwds.add(d['cwd']); last_cwd = d['cwd']
+            if d.get('gitBranch'):
+                branches.add(d['gitBranch'])
+            if t == 'ai-title' and d.get('aiTitle'):
+                title = d['aiTitle']          # rewritten each turn; last wins
+            elif t == 'last-prompt' and d.get('lastPrompt'):
+                last_prompt = d['lastPrompt']
+            elif t in ('user', 'assistant'):
+                messages += 1
+                msg = d.get('message', {}) or {}
+                if t == 'user' and first_prompt is None and not d.get('isMeta'):
+                    s = text_of(msg).strip()
+                    if s:
+                        first_prompt = s
+                if t == 'assistant':
+                    for x in (msg.get('content') or []):
+                        if isinstance(x, dict) and x.get('type') == 'tool_use':
+                            cmd = str((x.get('input') or {}).get('command', ''))
+                            if 'git commit' in cmd:
+                                commits += 1
+            if d.get('isCompactSummary') or t == 'compact-summary':
+                compacted = True
+    repos = sorted({git_root(c) for c in cwds})
+    return dict(started=started, ended=ended, title=title, cwd=last_cwd,
+                first_prompt=(first_prompt or '')[:400],
+                last_prompt=(last_prompt or '')[:400],
+                repos=','.join(os.path.basename(r) for r in repos),
+                branches=','.join(sorted(branches)),
+                messages=messages, commits=commits,
+                compacted=int(compacted))
+
+def live_session_ids():
+    """Sessions with a running process - never GC these."""
+    live = set()
+    for cd in config_dirs():
+        for p in glob.glob(os.path.join(cd, 'sessions', '*.json')):
+            try:
+                with open(p) as f:
+                    d = json.load(f)
+            except Exception:
+                continue
+            pid, sid = d.get('pid'), d.get('sessionId')
+            if not sid:
+                continue
+            if pid:
+                try:
+                    os.kill(int(pid), 0)   # signal 0 = liveness probe only
+                except (OSError, ValueError):
+                    continue
+            live.add(sid)
+    return live
+
+def cmd_rebuild(argv, quiet=False):
+    full = '--full' in argv
+    c = db()
+    seen, new, upd = set(), 0, 0
+    for cd in config_dirs():
+        for path in glob.glob(os.path.join(cd, 'projects', '*', '*.jsonl')):
+            sid = os.path.basename(path)[:-6]
+            seen.add(sid)
+            st = os.stat(path)
+            if not full:
+                row = c.execute('SELECT mtime, size FROM session WHERE id=?', (sid,)).fetchone()
+                if row and row[0] == st.st_mtime and row[1] == st.st_size:
+                    continue
+            d = scan(path)
+            d.update(id=sid, path=path, config_dir=cd, mtime=st.st_mtime, size=st.st_size)
+            cols = list(d)
+            # INSERT ... ON CONFLICT UPDATE of derived columns ONLY:
+            # `protected` and `note` survive every rebuild.
+            c.execute(
+                f"INSERT INTO session ({','.join(cols)}) VALUES ({','.join('?' * len(cols))}) "
+                f"ON CONFLICT(id) DO UPDATE SET "
+                + ','.join(f'{k}=excluded.{k}' for k in cols if k != 'id'),
+                [d[k] for k in cols])
+            if c.total_changes:
+                new += 1
+    # drop rows whose transcript is gone, unless protected (keeps the note)
+    gone = [r[0] for r in c.execute('SELECT id FROM session WHERE protected=0')
+            if r[0] not in seen]
+    for sid in gone:
+        c.execute('DELETE FROM session WHERE id=?', (sid,))
+    c.commit()
+    if quiet:
+        return
+    total = c.execute('SELECT COUNT(*) FROM session').fetchone()[0]
+    print(f'indexed {len(seen)} transcript(s) across {len(config_dirs())} config dir(s); '
+          f'{new} written, {len(gone)} stale row(s) dropped; {total} in index')
+
+def rows(query=None, show_all=True, config_dir=None, under=None, near=None):
+    c = db()
+    sql = ('SELECT id, ended, title, first_prompt, last_prompt, repos, branches, '
+           'messages, commits, protected, note, cwd FROM session')
+    where, args = [], []
+    if not show_all:
+        where.append('(protected=1 OR ended >= date("now","-30 days"))')
+    if config_dir:
+        where.append('config_dir=?'); args.append(config_dir)
+    if under:   # only sessions whose cwd is inside this tree (a root-scoped tenant)
+        u = under.rstrip('/')
+        where.append('(cwd = ? OR cwd LIKE ?)'); args += [u, u + '/%']
+    if where:
+        sql += ' WHERE ' + ' AND '.join(where)
+    sql += ' ORDER BY protected DESC, ended DESC'
+    out = []
+    for r in c.execute(sql, args):
+        (sid, ended, title, fp, lp, repos, branches, msgs, commits, prot, note, cwd) = r
+        label = title or (fp or '')[:60] or '(empty)'
+        when = (ended or '')[:16].replace('T', ' ')
+        mark = '*' if prot else ' '
+        meta = ' '.join(x for x in [repos or '', branches or ''] if x)
+        tail = f'{msgs}m' + (f' {commits}c' if commits else '')
+        line = f'{mark} {when}  {label}  [{meta}]  {tail}'
+        if note:
+            line += f'  # {note}'
+        if query and query.lower() not in (line + ' ' + (lp or '')).lower():
+            continue
+        out.append((sid, line, cwd or ''))
+    if near:
+        # The directory you launched from is an intent signal: surface its repo's
+        # sessions first. Rank, don't filter - filtering by cwd is the bucketing
+        # behaviour this tool exists to undo. Stable, so recency holds within
+        # each group.
+        nr = git_root(near).rstrip('/')
+        out.sort(key=lambda t: not (t[2] == nr or t[2].startswith(nr + '/')))
+    return out
+
+def refresh(argv):
+    if '--no-rebuild' in argv:
+        return
+    try:
+        cmd_rebuild([], quiet=True)
+    except Exception:
+        pass   # a broken index must never block the picker
+
+def cmd_list(argv):
+    refresh(argv)
+    show_all = '-a' in argv or '--all' in argv
+    cfg, und, nr = opt(argv, '--config-dir'), opt(argv, '--under'), opt(argv, '--near')
+    skip = {'--config-dir', cfg, '--under', und, '--near', nr}
+    q = ' '.join(a for a in argv if not a.startswith('-') and a not in skip) or None
+    for sid, line, cwd in rows(q, show_all=show_all, config_dir=cfg, under=und, near=nr):
+        print(f'{sid}\t{line}')
+
+def opt(argv, name):
+    """--name VALUE -> VALUE, else None."""
+    if name in argv:
+        i = argv.index(name)
+        if i + 1 < len(argv):
+            return argv[i + 1]
+    return None
+
+def cmd_pick(argv):
+    refresh(argv)
+    if not shutil.which('fzf'):
+        sys.exit('csbox-sessions: fzf not found (brew install fzf)')
+    show_all = '-a' in argv or '--all' in argv
+    cfg, und, nr = opt(argv, '--config-dir'), opt(argv, '--under'), opt(argv, '--near')
+    ncwd = opt(argv, '--new-cwd')
+    skip = {'--config-dir', cfg, '--under', und, '--near', nr, '--new-cwd', ncwd}
+    q = ' '.join(a for a in argv if not a.startswith('-') and a not in skip)
+    data = rows(None, show_all=show_all, config_dir=cfg, under=und, near=nr)
+    if '--allow-new' in argv:
+        # Always first, so Enter on an untouched picker starts fresh - and so an
+        # empty index still opens something useful instead of erroring out.
+        where = ncwd or nr or os.getcwd()
+        data.insert(0, ('new', f'+ new session in {os.path.basename(where.rstrip("/")) or where}', where))
+    if not data:
+        sys.exit('csbox-sessions: no sessions indexed for this config dir')
+    feed = ''.join(f'{sid}\t{line}\n' for sid, line, _ in data)
+    r = subprocess.run(
+        ['fzf', '--delimiter=\t', '--with-nth=2..', '--no-sort',
+         '--height=60%', '--reverse', '--query', q,
+         '--select-1', '--exit-0',   # unambiguous query -> no keypress needed
+         '--prompt=session> ', '--preview-window=hidden'],
+        input=feed, capture_output=True, text=True)
+    if r.returncode != 0 or not r.stdout.strip():
+        sys.exit(1)
+    sid = r.stdout.split('\t', 1)[0]
+    if '--fields' in argv:   # id + cwd, for csandbox to resume into the right project dir
+        cwd = next((c for i, _, c in data if i == sid), '')
+        print(f'{sid}\t{cwd}')
+    else:
+        print(sid)
+
+def cmd_resume(argv):
+    import io
+    buf = io.StringIO()
+    old, sys.stdout = sys.stdout, buf
+    try:
+        cmd_pick(argv)
+    finally:
+        sys.stdout = old
+    sid = buf.getvalue().strip()
+    if not sid:
+        sys.exit(1)
+    os.execvp('claude', ['claude', '--resume', sid])
+
+def cmd_flag(argv, value):
+    if not argv:
+        sys.exit('usage: csbox-sessions {protect|unprotect} <session-id>...')
+    c = db()
+    for sid in argv:
+        n = c.execute('UPDATE session SET protected=? WHERE id LIKE ?',
+                      (value, sid + '%')).rowcount
+        print(f'{sid}: {"protected" if value else "unprotected"}' if n else f'{sid}: not found')
+    c.commit()
+
+def cmd_note(argv):
+    if len(argv) < 2:
+        sys.exit('usage: csbox-sessions note <session-id> <text>')
+    c = db()
+    n = c.execute('UPDATE session SET note=? WHERE id LIKE ?',
+                  (' '.join(argv[1:]), argv[0] + '%')).rowcount
+    c.commit()
+    print(f'{argv[0]}: {"noted" if n else "not found"}')
+
+def cmd_gc(argv):
+    """Only ever removes the genuinely worthless. Deletion is irreversible;
+    noise is better solved by `list` filtering, which is not."""
+    apply = '--apply' in argv
+    c, live = db(), live_session_ids()
+    cands = c.execute(
+        'SELECT id, path, messages, ended FROM session '
+        'WHERE protected=0 AND commits=0 AND compacted=0 AND messages < 4').fetchall()
+    n = 0
+    for sid, path, msgs, ended in cands:
+        if sid in live:
+            print(f'skip (live)  {sid[:8]}')
+            continue
+        print(f'{"delete" if apply else "would delete"}  {sid[:8]}  {msgs}m  {(ended or "")[:16]}')
+        if apply:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            c.execute('DELETE FROM session WHERE id=?', (sid,))
+        n += 1
+    c.commit()
+    print(f'\n{n} session(s) {"deleted" if apply else "would be deleted"}'
+          + ('' if apply else ' - re-run with --apply'))
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ('-h', '--help', 'help'):
+        print(__doc__)
+        return
+    cmd, rest = argv[0], argv[1:]
+    fns = {'rebuild': cmd_rebuild, 'list': cmd_list, 'ls': cmd_list, 'pick': cmd_pick,
+           'resume': cmd_resume, 'note': cmd_note, 'gc': cmd_gc,
+           'protect': lambda a: cmd_flag(a, 1), 'unprotect': lambda a: cmd_flag(a, 0)}
+    if cmd not in fns:
+        sys.exit(f'csbox-sessions: unknown command {cmd!r} (try --help)')
+    fns[cmd](rest)
+
+if __name__ == '__main__':
+    main()

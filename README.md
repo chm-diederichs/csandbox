@@ -25,7 +25,9 @@ csandbox                       # sandbox the current directory (minimal egress)
 csandbox ~/code/myapp          # sandbox a specific project
 csandbox . --continue          # unknown args are passed to `claude`
 csandbox --profile dev .       # allow npm + git + pypi for this session
-csandbox --tenant work .       # a second Claude account: own config dir, login, proxy port, findings (see below)
+csandbox                       # no args: pick a session to resume (fzf), in its own project dir
+csandbox -n                    # straight to a new session in the current dir
+csandbox --tenant work .       # a second Claude account: own config dir, login, proxy port
 csandbox --help                # every flag, and the env var each one defaults from
 ```
 
@@ -157,11 +159,11 @@ prints the same table.
 | `--allow <host[,host]>`   | `CSANDBOX_EXTRA_DOMAINS`  | Extra hosts to allow on top of the profile(s); repeatable.                              |
 | `--udp <local\|open>`     | `CSANDBOX_UDP`            | Allow UDP: `local` = loopback minus DNS, `open` = all outbound. bwrap only.             |
 | `--root <dir>`            | `CSANDBOX_ROOT`           | Workspace root to mount; **remembered per tenant** in `<config>/root` and applied to every later run of that tenant (delete the file to forget). Default: `~/hyper` when the project is under it, else the project dir. A run started outside the root with no project dir lands at the root. |
+| `-n`, `--new`            | —                         | New session; skip the picker that bare `csandbox` opens. |
 | `--readonly`              | `CSANDBOX_READONLY=1`     | Mount the workspace read-only.                                                          |
-| `--tenant <name>`         | `CSANDBOX_TENANT`         | Second Claude account: config dir `~/.claude-sandbox-<name>`, own login, proxy port and findings store. |
+| `--tenant <name>`         | `CSANDBOX_TENANT`         | Second Claude account: config dir `~/.claude-sandbox-<name>`, own login and proxy port. |
 | `--config-dir <dir>`      | `CSANDBOX_CONFIG_DIR`     | Explicit config dir (wins over the tenant name). Pair with `--proxy-port`.              |
 | `--proxy-port <n>`        | `CSANDBOX_PROXY_PORT`     | This tenant's egress proxy port. Default tenant 8888; named tenants are allocated one from the range `bwrap-setup` opened. |
-| `--findings` / `--no-findings` | `CSANDBOX_FINDINGS=0` | Cross-session findings memory, on by default.                                           |
 | `--edit-gate`             | `CSANDBOX_EDIT_GATE=1`    | Opt-in hook: the first edit to an existing source file is refused once with a fact request. Off by default. |
 | `--shell`                 | `CSANDBOX_SHELL=1`        | Drop into `bash` inside the sandbox instead of launching `claude`.                      |
 | `--dry-run`               | `CSANDBOX_DRYRUN=1`       | Print the resolved config (mounts, allowlist) and exit without launching.               |
@@ -172,8 +174,6 @@ Machine configuration is environment-only:
 | Variable                 | Effect                                                                                  |
 | ------------------------ | --------------------------------------------------------------------------------------- |
 | `CSANDBOX_BACKEND`       | `bwrap` (Linux) or `seatbelt` (macOS); defaults by OS.                                  |
-| `CSANDBOX_FINDINGS_DIR`  | Where the findings tool lives (default: `findings` on PATH, then `~/dev/findings`).     |
-| `CSANDBOX_FINDINGS_HOME` | Findings store override. Default `~/.findings` for the default tenant, `<config>/findings` for a named one - per account unless you point two tenants at one dir. |
 
 
 ---
@@ -185,19 +185,18 @@ claude-sandbox/
 ├── README.md            # this file
 ├── csandbox             # the launcher (symlinked into ~/.local/bin)
 ├── bwrap-setup          # one-time root setup (AppArmor profile, slice, nft rule)
-├── git-hooks/
-│   ├── post-checkout   # fires on `git worktree add`; auto-hydrates node_modules
-│   └── wt-hydrate      # clones node_modules from the main worktree (CoW), offline
+├── docs/DESIGN.md       # architecture, decision log, what was removed and why
+├── bin/
+│   └── csbox-enter-repo # worktree a repo pinned to this session's snapshot
+├── csbox-sessions       # searchable index over session transcripts (fzf picker)
 ├── claude-hooks/        # Claude Code lifecycle hooks, mounted + registered per launch
 │   ├── edit-gate              # PreToolUse (opt-in, CSANDBOX_EDIT_GATE=1): first edit asks for importers/exports/formats once
-│   ├── findings-hook          # prompt: auto-recall · stop: record nudge · compact: re-inject
-│   └── memory-findings-nudge  # PostToolUse: mirror auto-memory writes into findings
-├── skills/              # harness-level skills, copied into the sandbox config each launch (docs/skills.md)
+├── skills/              # harness-level skills, copied into the sandbox config each launch (docs/DESIGN.md)
 │   ├── autonomous-preflight/  # goal/done/boundary block before any unattended run or fan-out
 │   ├── strict-review/         # reviewer brief: cite line + trigger or drop the finding
 │   ├── hunt-silent-failures/  # swallowed errors, streams/emitters that drop them
 │   ├── tdd-brittle/           # RED gate that must actually run and fail for the right reason
-│   └── perf-loop/             # bounded measure→variant→promote loop, ledger in findings
+│   └── perf-loop/             # bounded measure→variant→promote loop
 └── egress-proxy/
     └── proxy.js         # allowlist-enforcing forward proxy (no deps), run directly by bwrap
 ```
@@ -236,13 +235,13 @@ git worktree (`Agent(isolation: "worktree")`), all inside the one sandbox.
 Worktrees don't inherit `node_modules` (it's gitignored), but the parallel phase
 should be **network-quiet** — no subagent should hit the npm registry.
 
-So a system-wide `post-checkout` git hook (`git-hooks/`, installed per-run via
-`GIT_CONFIG_SYSTEM`) fires whenever a worktree is created and clones
-`node_modules` from the repo's main worktree — copy-on-write where the host fs
-supports it, offline always. It's guarded to run only on worktree creation (null
-prev-SHA in a linked worktree), is idempotent, and is monorepo-aware (mirrors
-`node_modules` at the repo root and each workspace package). Verified to fire on
-the Agent tool's own worktree creation.
+So csandbox seeds `worktree.symlinkDirectories: ["node_modules"]` into the
+sandbox `settings.json`, and Claude Code symlinks `node_modules` from the main
+checkout into every worktree it creates — instant, offline, and no disk cost.
+This replaced a `post-checkout` git hook that copied `node_modules` per
+worktree: its `cp --reflink=auto` is GNU-only, so on macOS it degraded to a
+full 300-500MB copy each time. Worktrees now share one `node_modules`, which is
+fine since nothing pins deps per worktree any more.
 
 The one case that still needs the network is a subagent **adding a new
 dependency** — that's a registry fetch, so it surfaces at the egress proxy
@@ -253,48 +252,6 @@ The top-level agent is told all this via the seeded global `CLAUDE.md` (a
 "Parallel worktree subagents" section), so it fans out correctly without
 re-installing deps or reaching for the network mid-run.
 
-## Linked local dependencies (linker)
-
-For poly-repos that link to each other locally (the `~/hyper` pattern), the
-sandbox integrates [`linker`](../../dev/linker) — a declarative `npm link`
-substitute. A repo's `links.json` pins each local dependency to a sha; the same
-`post-checkout` hook that hydrates `node_modules` also runs
-`linker load --worktree --branch <the-worktree's-branch>`, so every linked dep
-becomes a **worktree pinned to its declared sha, isolated to that worktree's
-branch**, symlinked into `node_modules`. Two parallel sessions therefore get
-independent worktrees of a shared dep instead of fighting over one checkout, and
-the whole thing stays offline (the deps are already under the mount).
-
-`linker` isn't published yet, so it's **mounted in from the host** rather than
-baked into the image: csandbox mounts the host `linker` package at `/opt/linker`
-(with a wrapper on `PATH`) plus the host `~/.linker/registry.json` (name→path).
-Host paths resolve in-container because the workspace mounts at the same path.
-This is best-effort — if `linker` isn't on the host `PATH`, the sandbox just
-skips it (no links wired). The agent is told it's automatic via a seeded
-"Linked local dependencies" `CLAUDE.md` section (only added when linker is
-active).
-
-## Findings memory
-
-On by default (`--no-findings` / `CSANDBOX_FINDINGS=0` to opt out) when the
-[`findings`](../../dev/findings) tool is present on the host: a shared,
-queryable SQLite store of distilled claims (`observation` / `decision` /
-`memory`) that lets sessions stay short and ephemeral instead of carrying one
-long, lossily-compacted transcript. Like linker it is mounted, not baked: the
-CLI at `/opt/findings`, a wrapper on `PATH`, and the tenant's store read-write
-(`~/.findings` for the default tenant, `<config>/findings` for a named one) so
-every session of that account reads and writes one store. Findings are keyed by repo (the main
-worktree, however many linked worktrees recorded them), and observations flag
-"verify" when their files changed since they were recorded.
-
-Three hooks (`claude-hooks/findings-hook`) make it work without relying on the
-agent remembering to: `UserPromptSubmit` recalls the prompt's terms and injects
-the matching claims as reference-only context; `Stop` nudges once if a
-substantial session recorded nothing; `SessionStart(compact)` re-injects what
-was shown before compaction. Every command is traced to `~/.findings/events.jsonl`
-(`findings stats`) so recall miss-rate is measurable. Design and observed
-numbers: `docs/findings-memory.md`.
-
 ## Multiple accounts (tenants)
 
 A tenant is a separate Claude Code config dir, which is exactly the boundary
@@ -303,11 +260,7 @@ OAuth login, the account/org ids, settings, sessions and the cached
 server-managed org policy under that dir, and under bwrap the host `~/.claude`
 is not mounted at all, so tenants can't see each other. Everything else is per
 user and shared: the workspace mount, the systemd slice and nft rule, and the
-wrapper scripts. The **findings store is per tenant** - it is what an account's
-sessions learned, so it lives in `<config>/findings` for a named tenant (the
-default tenant keeps the pre-existing `~/.findings`, which is also the host CLI's
-default). Set `CSANDBOX_FINDINGS_HOME` on two tenants to the same dir if you
-want them to share deliberately.
+wrapper scripts.
 
 ```bash
 csandbox --tenant work --root ~/work .                    # ~/.claude-sandbox-work, scoped to ~/work from now on
@@ -349,7 +302,7 @@ runs.
 Harness-level skills live in `skills/<name>/SKILL.md` and are copied into the
 sandbox config dir on every launch, where Claude Code discovers them
 (`autonomous-preflight`, `strict-review`, `hunt-silent-failures`,
-`tdd-brittle`, `perf-loop`, plus `findings` from its own repo). Three short
+`tdd-brittle`, `perf-loop`). Three short
 always-on rules are seeded into the sandbox `CLAUDE.md`: the worker contract
 (final message is the deliverable, never end a turn with children running, one
 task then stop), a lane table before fanning out (parallel only when write
@@ -358,7 +311,7 @@ surfaces don't collide). An opt-in edit gate (`CSANDBOX_EDIT_GATE=1`) adds a
 per session until the agent lists the module's importers across the workspace,
 the exports it touches and any formats involved. It is off by default: agents
 were observed treating the refusal as done and moving on without the edit. How
-skills are written, placed and tested: `docs/skills.md`.
+skills are written, placed and tested: `docs/DESIGN.md`.
 
 ---
 
@@ -373,9 +326,6 @@ sudo ~/hyper/claude-sandbox/bwrap-setup
 # 2. put the launcher on PATH
 ln -sf ~/hyper/claude-sandbox/csandbox ~/.local/bin/csandbox
 
-# 3. (optional) enable linked local deps: put linker on PATH, register repos
-cd ~/dev/linker && npm install && npm link
-linker register corestore ~/hyper/corestore   # once per local dep
 ```
 
 Requires: Linux, with `bubblewrap`, `nftables`, `apparmor`, and a systemd user
