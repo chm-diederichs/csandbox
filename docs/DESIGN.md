@@ -165,7 +165,8 @@ snapshot, so concurrent host-side checkouts can't disturb a running session.
 
 A skill is a playbook loaded only when a task needs it. It earns its place by
 changing what an agent *does*, measured — not by documenting good intentions.
-Pick the smallest surface that fits:
+
+**Pick the smallest surface that fits.**
 
 1. Must happen **every time** a path or event matches, no judgment → a **hook**
    (`claude-hooks/`), or a seeded CLAUDE.md rule (always in context, so under
@@ -174,9 +175,65 @@ Pick the smallest surface that fits:
    (`skills/<name>/SKILL.md`).
 3. A **local action** a command can do → a **script**, plus a skill saying when
    to run it.
+4. Needs a structured interactive interface across clients → MCP. Not needed yet.
 
-Every rule should name the failure it prevents. Mechanical steps belong in
-scripts; judgment belongs in short reference files loaded on demand.
+Rules are "what", skills are "how": principles and hard limits go always-on;
+commands, examples and procedures stay in the skill. A rule must be writable as
+"do X / don't do Y" plus one sentence on what goes wrong otherwise. If it needs
+a paragraph of context, it is a skill.
+
+**Where they live.** Harness-level skills live here in `skills/<name>/SKILL.md`;
+csandbox copies them into the sandbox config dir every launch, where Claude Code
+discovers them as user skills. Copy, not mount — host edits land next launch and
+the agent cannot write back into this repo. Repo-specific skills live in that
+repo under `.claude/skills/` and are discovered from the worktree.
+
+Frontmatter is `name` + `description`, inline scalars only. The description is
+the trigger: third person, "does X. Use when <concrete situations>. Do not use
+for <the adjacent thing it is not>." Everything else is body.
+
+**Shape of a good one.**
+
+- 50-120 lines. Above ~150, split mechanics into `scripts/` and depth into
+  `references/` the body points at.
+- Every rule paired with the **observed failure** it prevents. A rule with no
+  failure behind it is a platitude and gets cut.
+- Decision tables with yes/no columns; a fixed **output block** the agent must
+  produce, so compliance is checkable from the transcript.
+- Explicit stop conditions, and what the skill must **not** do.
+- No cross-references to other skills as prerequisites; a skill stands alone.
+- No invented numbers (coverage %, line limits) unless measured here.
+
+**Test that it changes behaviour.** "Load it and see if Claude mentions it" is
+not a test. Run the same task three ways and diff the tool traces:
+
+| level | prompt | expectation |
+|---|---|---|
+| supportive | names the skill / asks for its method | every required step present, in order |
+| neutral | the bare task | it self-triggers from its description and the steps appear |
+| competing | "quickly, skip the ceremony" | the hard gates still hold |
+
+Capture with `claude -p --output-format stream-json`, extract the tool calls,
+and check the skill's required steps appear in order. Passing only the
+supportive level is a **trigger** problem. Failing the competing level means it
+has no teeth and should become a hook. Not automated; do it by hand per skill.
+
+**Lesson for hooks generally: prefer injecting context (`UserPromptSubmit`,
+`SessionStart`) over refusing calls.** A hook that refuses a tool call needs the
+agent to retry, and that does not reliably happen — see edit-gate above.
+
+**Current set.**
+
+| skill | the failure it replaces |
+|---|---|
+| autonomous-preflight | loops that spin, game "tests pass", or run the wrong answer unasked |
+| strict-review | manufactured findings, severity inflation, self-review |
+| hunt-silent-failures | swallowed errors and streams that drop them |
+| tdd-brittle | RED faked by an unexecuted or mis-failing test |
+| perf-loop | phantom wins inside noise, retesting the same idea |
+
+All informed by a 2026-09 read of ECC (github.com/affaan-m/ECC); nothing taken
+verbatim, and the rest of that repo was judged not worth porting.
 
 ## Open
 
