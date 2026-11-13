@@ -18,6 +18,7 @@ Sessions bucket by escaped-cwd under <config>/projects/, so the built-in
         --config-dir DIR            only sessions from that config dir
         --under DIR                 only sessions whose cwd is inside DIR
         --near DIR                  rank DIR's repo first (does not filter)
+        --allow-new [--new-cwd DIR] offer '+ new session' as the first entry
   csbox-sessions resume [query]     pick, then exec `claude --resume <id>`
   csbox-sessions protect <id>...    mark keep-forever (also pins it in --all)
   csbox-sessions unprotect <id>...
@@ -280,9 +281,15 @@ def cmd_pick(argv):
         sys.exit('csbox-sessions: fzf not found (brew install fzf)')
     show_all = '-a' in argv or '--all' in argv
     cfg, und, nr = opt(argv, '--config-dir'), opt(argv, '--under'), opt(argv, '--near')
-    skip = {'--config-dir', cfg, '--under', und, '--near', nr}
+    ncwd = opt(argv, '--new-cwd')
+    skip = {'--config-dir', cfg, '--under', und, '--near', nr, '--new-cwd', ncwd}
     q = ' '.join(a for a in argv if not a.startswith('-') and a not in skip)
     data = rows(None, show_all=show_all, config_dir=cfg, under=und, near=nr)
+    if '--allow-new' in argv:
+        # Always first, so Enter on an untouched picker starts fresh - and so an
+        # empty index still opens something useful instead of erroring out.
+        where = ncwd or nr or os.getcwd()
+        data.insert(0, ('new', f'+ new session in {os.path.basename(where.rstrip("/")) or where}', where))
     if not data:
         sys.exit('csbox-sessions: no sessions indexed for this config dir')
     feed = ''.join(f'{sid}\t{line}\n' for sid, line, _ in data)

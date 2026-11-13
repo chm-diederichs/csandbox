@@ -343,16 +343,32 @@ if [ $# -eq 0 ] && [ "$NEW" != 1 ] && [ "${CSANDBOX_DRYRUN:-}" != "1" ] \
   # With a root in force (--root, env, or the tenant's remembered root) only
   # offer sessions inside it: the project-dir-inside-root check below is fatal,
   # and a root-scoped tenant is meant to stay in its tree.
-  _under=(); [ -n "${CSANDBOX_ROOT:-}" ] && _under=(--under "$CSANDBOX_ROOT")
+  _under=(); _newcwd="$PWD"
+  if [ -n "${CSANDBOX_ROOT:-}" ]; then
+    _under=(--under "$CSANDBOX_ROOT")
+    # a new session started outside the root lands AT the root (the same clamp
+    # the no-arg path applies below), so label the entry with where it lands
+    case "$PWD" in "$CSANDBOX_ROOT" | "$CSANDBOX_ROOT"/*) ;; *) _newcwd="$CSANDBOX_ROOT" ;; esac
+  fi
   # --near ranks the repo you launched from to the top without hiding anything
   # else; the dir you are standing in is the likeliest thing you meant.
   _picked="$(csbox-sessions pick --fields --config-dir "$CONFIG_DIR" --near "$PWD" \
-             "${_under[@]+"${_under[@]}"}" 2>/dev/null)" || {
-    echo "csandbox: no session chosen (-n for a new one)" >&2; exit 0; }
+             --allow-new --new-cwd "$_newcwd" "${_under[@]+"${_under[@]}"}" 2>/dev/null)" || {
+    echo "csandbox: cancelled (-n to skip the picker)" >&2; exit 0; }
   if [ -n "$_picked" ]; then
     _sid="${_picked%%	*}"; _scwd="${_picked#*	}"
-    [ -d "$_scwd" ] && set -- "$_scwd" --resume "$_sid" || set -- --resume "$_sid"
-    echo "csandbox: resuming ${_sid%%-*} in ${_scwd:-$PWD}"
+    if [ "$_sid" = new ]; then
+      : # "+ new session": leave argv empty so the cwd handling below applies
+        # unchanged - including its clamp into the root. Passing an explicit
+        # project dir here would bypass that clamp and hit the fatal
+        # not-inside-workspace-root check.
+    elif [ -d "$_scwd" ]; then
+      set -- "$_scwd" --resume "$_sid"
+      echo "csandbox: resuming ${_sid%%-*} in $_scwd"
+    else
+      set -- --resume "$_sid"
+      echo "csandbox: resuming ${_sid%%-*} (recorded cwd $_scwd is gone)"
+    fi
   fi
 fi
 
