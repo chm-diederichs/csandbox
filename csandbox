@@ -344,7 +344,10 @@ if [ $# -eq 0 ] && [ "$NEW" != 1 ] && [ "${CSANDBOX_DRYRUN:-}" != "1" ] \
   # offer sessions inside it: the project-dir-inside-root check below is fatal,
   # and a root-scoped tenant is meant to stay in its tree.
   _under=(); [ -n "${CSANDBOX_ROOT:-}" ] && _under=(--under "$CSANDBOX_ROOT")
-  _picked="$(csbox-sessions pick --fields --config-dir "$CONFIG_DIR" "${_under[@]+"${_under[@]}"}" 2>/dev/null)" || {
+  # --near ranks the repo you launched from to the top without hiding anything
+  # else; the dir you are standing in is the likeliest thing you meant.
+  _picked="$(csbox-sessions pick --fields --config-dir "$CONFIG_DIR" --near "$PWD" \
+             "${_under[@]+"${_under[@]}"}" 2>/dev/null)" || {
     echo "csandbox: no session chosen (-n for a new one)" >&2; exit 0; }
   if [ -n "$_picked" ]; then
     _sid="${_picked%%	*}"; _scwd="${_picked#*	}"

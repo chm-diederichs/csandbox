@@ -17,6 +17,7 @@ Sessions bucket by escaped-cwd under <config>/projects/, so the built-in
         --fields                    print 'id<TAB>cwd' instead of just the id
         --config-dir DIR            only sessions from that config dir
         --under DIR                 only sessions whose cwd is inside DIR
+        --near DIR                  rank DIR's repo first (does not filter)
   csbox-sessions resume [query]     pick, then exec `claude --resume <id>`
   csbox-sessions protect <id>...    mark keep-forever (also pins it in --all)
   csbox-sessions unprotect <id>...
@@ -210,7 +211,7 @@ def cmd_rebuild(argv, quiet=False):
     print(f'indexed {len(seen)} transcript(s) across {len(config_dirs())} config dir(s); '
           f'{new} written, {len(gone)} stale row(s) dropped; {total} in index')
 
-def rows(query=None, show_all=True, config_dir=None, under=None):
+def rows(query=None, show_all=True, config_dir=None, under=None, near=None):
     c = db()
     sql = ('SELECT id, ended, title, first_prompt, last_prompt, repos, branches, '
            'messages, commits, protected, note, cwd FROM session')
@@ -239,6 +240,13 @@ def rows(query=None, show_all=True, config_dir=None, under=None):
         if query and query.lower() not in (line + ' ' + (lp or '')).lower():
             continue
         out.append((sid, line, cwd or ''))
+    if near:
+        # The directory you launched from is an intent signal: surface its repo's
+        # sessions first. Rank, don't filter - filtering by cwd is the bucketing
+        # behaviour this tool exists to undo. Stable, so recency holds within
+        # each group.
+        nr = git_root(near).rstrip('/')
+        out.sort(key=lambda t: not (t[2] == nr or t[2].startswith(nr + '/')))
     return out
 
 def refresh(argv):
@@ -252,10 +260,10 @@ def refresh(argv):
 def cmd_list(argv):
     refresh(argv)
     show_all = '-a' in argv or '--all' in argv
-    cfg, und = opt(argv, '--config-dir'), opt(argv, '--under')
-    skip = {'--config-dir', cfg, '--under', und}
+    cfg, und, nr = opt(argv, '--config-dir'), opt(argv, '--under'), opt(argv, '--near')
+    skip = {'--config-dir', cfg, '--under', und, '--near', nr}
     q = ' '.join(a for a in argv if not a.startswith('-') and a not in skip) or None
-    for sid, line, cwd in rows(q, show_all=show_all, config_dir=cfg, under=und):
+    for sid, line, cwd in rows(q, show_all=show_all, config_dir=cfg, under=und, near=nr):
         print(f'{sid}\t{line}')
 
 def opt(argv, name):
@@ -271,10 +279,10 @@ def cmd_pick(argv):
     if not shutil.which('fzf'):
         sys.exit('csbox-sessions: fzf not found (brew install fzf)')
     show_all = '-a' in argv or '--all' in argv
-    cfg, und = opt(argv, '--config-dir'), opt(argv, '--under')
-    skip = {'--config-dir', cfg, '--under', und}
+    cfg, und, nr = opt(argv, '--config-dir'), opt(argv, '--under'), opt(argv, '--near')
+    skip = {'--config-dir', cfg, '--under', und, '--near', nr}
     q = ' '.join(a for a in argv if not a.startswith('-') and a not in skip)
-    data = rows(None, show_all=show_all, config_dir=cfg, under=und)
+    data = rows(None, show_all=show_all, config_dir=cfg, under=und, near=nr)
     if not data:
         sys.exit('csbox-sessions: no sessions indexed for this config dir')
     feed = ''.join(f'{sid}\t{line}\n' for sid, line, _ in data)
