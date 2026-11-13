@@ -340,7 +340,11 @@ fi
 # different CLAUDE_CONFIG_DIR and could not be resumed here.
 if [ $# -eq 0 ] && [ "$NEW" != 1 ] && [ "${CSANDBOX_DRYRUN:-}" != "1" ] \
    && [ "${CSANDBOX_SHELL:-}" != "1" ] && command -v csbox-sessions >/dev/null 2>&1; then
-  _picked="$(csbox-sessions pick --fields --config-dir "$CONFIG_DIR" 2>/dev/null)" || {
+  # With a root in force (--root, env, or the tenant's remembered root) only
+  # offer sessions inside it: the project-dir-inside-root check below is fatal,
+  # and a root-scoped tenant is meant to stay in its tree.
+  _under=(); [ -n "${CSANDBOX_ROOT:-}" ] && _under=(--under "$CSANDBOX_ROOT")
+  _picked="$(csbox-sessions pick --fields --config-dir "$CONFIG_DIR" "${_under[@]+"${_under[@]}"}" 2>/dev/null)" || {
     echo "csandbox: no session chosen (-n for a new one)" >&2; exit 0; }
   if [ -n "$_picked" ]; then
     _sid="${_picked%%	*}"; _scwd="${_picked#*	}"

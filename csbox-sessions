@@ -16,6 +16,7 @@ Sessions bucket by escaped-cwd under <config>/projects/, so the built-in
   csbox-sessions pick [query]       fzf picker -> prints the chosen session id
         --fields                    print 'id<TAB>cwd' instead of just the id
         --config-dir DIR            only sessions from that config dir
+        --under DIR                 only sessions whose cwd is inside DIR
   csbox-sessions resume [query]     pick, then exec `claude --resume <id>`
   csbox-sessions protect <id>...    mark keep-forever (also pins it in --all)
   csbox-sessions unprotect <id>...
@@ -209,7 +210,7 @@ def cmd_rebuild(argv, quiet=False):
     print(f'indexed {len(seen)} transcript(s) across {len(config_dirs())} config dir(s); '
           f'{new} written, {len(gone)} stale row(s) dropped; {total} in index')
 
-def rows(query=None, show_all=True, config_dir=None):
+def rows(query=None, show_all=True, config_dir=None, under=None):
     c = db()
     sql = ('SELECT id, ended, title, first_prompt, last_prompt, repos, branches, '
            'messages, commits, protected, note, cwd FROM session')
@@ -218,6 +219,9 @@ def rows(query=None, show_all=True, config_dir=None):
         where.append('(protected=1 OR ended >= date("now","-30 days"))')
     if config_dir:
         where.append('config_dir=?'); args.append(config_dir)
+    if under:   # only sessions whose cwd is inside this tree (a root-scoped tenant)
+        u = under.rstrip('/')
+        where.append('(cwd = ? OR cwd LIKE ?)'); args += [u, u + '/%']
     if where:
         sql += ' WHERE ' + ' AND '.join(where)
     sql += ' ORDER BY protected DESC, ended DESC'
@@ -248,10 +252,10 @@ def refresh(argv):
 def cmd_list(argv):
     refresh(argv)
     show_all = '-a' in argv or '--all' in argv
-    cfg = opt(argv, '--config-dir')
-    skip = {'--config-dir', cfg} if cfg else set()
+    cfg, und = opt(argv, '--config-dir'), opt(argv, '--under')
+    skip = {'--config-dir', cfg, '--under', und}
     q = ' '.join(a for a in argv if not a.startswith('-') and a not in skip) or None
-    for sid, line, cwd in rows(q, show_all=show_all, config_dir=cfg):
+    for sid, line, cwd in rows(q, show_all=show_all, config_dir=cfg, under=und):
         print(f'{sid}\t{line}')
 
 def opt(argv, name):
@@ -267,10 +271,10 @@ def cmd_pick(argv):
     if not shutil.which('fzf'):
         sys.exit('csbox-sessions: fzf not found (brew install fzf)')
     show_all = '-a' in argv or '--all' in argv
-    cfg = opt(argv, '--config-dir')
-    skip = {'--config-dir', cfg} if cfg else set()
+    cfg, und = opt(argv, '--config-dir'), opt(argv, '--under')
+    skip = {'--config-dir', cfg, '--under', und}
     q = ' '.join(a for a in argv if not a.startswith('-') and a not in skip)
-    data = rows(None, show_all=show_all, config_dir=cfg)
+    data = rows(None, show_all=show_all, config_dir=cfg, under=und)
     if not data:
         sys.exit('csbox-sessions: no sessions indexed for this config dir')
     feed = ''.join(f'{sid}\t{line}\n' for sid, line, _ in data)
