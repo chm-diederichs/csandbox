@@ -8,7 +8,7 @@
 #                     proxy. One-time root setup first: `sudo ./bwrap-setup`.
 #   macOS -> seatbelt Claude Code's own built-in OS sandbox (Seatbelt) - filesystem
 #                     scoping + a domain-allowlisted egress proxy, no root/setup.
-# The workflow layer (worktrees, linker, findings + its hooks, CLAUDE.md
+# The workflow layer (worktrees, CLAUDE.md
 # seeding) and the egress-allowlist model below are shared across both.
 #
 # The sandboxed process stays in the host's normal network namespace, but is
@@ -54,7 +54,7 @@
 #   csandbox --profile node,git --allow example.com .   # combine profiles, one-off host
 #   csandbox --readonly .                        # mount workspace read-only
 #   csandbox --shell .                           # drop into bash, not claude
-#   csandbox --tenant work .                     # a second Claude account: own config dir, login, proxy port, findings
+#   csandbox --tenant work .                     # a second Claude account: own config dir, login, proxy port
 #   csandbox --dry-run .                         # print resolved config & exit
 #   csandbox down [--tenant work]                # stop that tenant's egress proxy & exit
 #   csandbox --help
@@ -62,8 +62,7 @@
 # Convention: per-invocation choices are FLAGS; every flag has an environment
 # variable as its default (CSANDBOX_PROFILE, CSANDBOX_TENANT, ...), so a shell
 # profile can pin a preference. Machine configuration is environment-only:
-# CSANDBOX_BACKEND, CSANDBOX_FINDINGS_DIR (tool location), CSANDBOX_FINDINGS_HOME
-# (store override). --root is remembered per tenant (<config>/root). Flags are parsed anywhere
+# CSANDBOX_BACKEND. --root is remembered per tenant (<config>/root). Flags are parsed anywhere
 # in the argument list and shadow same-named claude flags. `--worktree` is NOT
 # ours: `csandbox . --worktree` passes it to claude's own flag (after the dir -
 # the first leftover arg is taken as the project dir).
@@ -100,13 +99,13 @@ SANDBOX_DIR="$(cd "$(dirname "$(resolve "${BASH_SOURCE[0]}")")" && pwd)"
 
 # bwrap has no image to define a fake home in, so it mounts everything at its
 # real host path instead. HOME_IN/BIN_IN are used throughout below so the
-# config/scratch/linker/findings mounts are only written once.
+# config/scratch mounts are only written once.
 HOME_IN="$HOME"
 # /usr is a read-only bind of the actual host /usr, so a NEW file can't be
 # created under it (the underlying directory is root-owned - a "rw" bind
 # doesn't change real DAC permissions). /opt is never bound from the host at
 # all, so we can freely create a fresh tree there instead for wrapper
-# binaries (linker/findings/git-hooks).
+# binaries (bin/).
 BIN_IN="/opt/csandbox-tools/bin"
 
 # --- backend selection + preflight -------------------------------------------
@@ -117,7 +116,7 @@ BIN_IN="/opt/csandbox-tools/bin"
 #              provides filesystem scoping AND a domain-allowlisted egress proxy
 #              with no external daemon, no root setup, and no image. See
 #              launch_seatbelt below. The workflow layer (session db, worktrees,
-#              linker, findings, CLAUDE.md seeding) is shared with bwrap.
+#              CLAUDE.md seeding) is shared with bwrap.
 BACKEND="${CSANDBOX_BACKEND:-}"
 if [ -z "$BACKEND" ]; then
   case "$(uname -s)" in
@@ -148,8 +147,8 @@ case "$BACKEND" in
 esac
 
 # --- mount list ---------------------------------------------------------
-# Every mount csandbox wants - workspace, config, scratch, linker/findings,
-# secret shadows, git-hooks - is recorded here once and translated to
+# Every mount csandbox wants - workspace, config, scratch,
+# secret shadows - is recorded here once and translated to
 # `--ro-bind`/`--bind` args at launch time.
 MOUNT_MODE=(); MOUNT_SRC=(); MOUNT_DST=()
 add_mount() { MOUNT_MODE+=("$1"); MOUNT_SRC+=("$2"); MOUNT_DST+=("$3"); }  # add_mount <ro|rw> <src> <dst>
@@ -163,7 +162,7 @@ Unknown arguments pass through to `claude`. Every flag has an environment
 variable default (in brackets); the variable is what hooks and subprocesses see.
 
   --tenant <name>        second Claude account: config dir ~/.claude-sandbox-<name>,
-                         own login, proxy port and findings store   [CSANDBOX_TENANT]
+                         own login and proxy port                    [CSANDBOX_TENANT]
   --config-dir <dir>     explicit config dir (wins over --tenant)    [CSANDBOX_CONFIG_DIR]
   --proxy-port <n>       this tenant's egress proxy port             [CSANDBOX_PROXY_PORT]
   --profile <p[,p]>      egress profile(s): minimal|node|git|python|dev|login|open  [CSANDBOX_PROFILE]
@@ -174,7 +173,6 @@ variable default (in brackets); the variable is what hooks and subprocesses see.
   --root <dir>           workspace root to mount; remembered per tenant in
                          <config>/root (delete the file to forget)   [CSANDBOX_ROOT]
   --readonly             mount the workspace read-only               [CSANDBOX_READONLY=1]
-  --findings / --no-findings   cross-session findings memory (default on)  [CSANDBOX_FINDINGS=0]
   --edit-gate            opt-in first-edit fact gate hook            [CSANDBOX_EDIT_GATE=1]
   --shell                drop into bash inside the sandbox           [CSANDBOX_SHELL=1]
   --dry-run              print the resolved config and exit          [CSANDBOX_DRYRUN=1]
@@ -182,9 +180,6 @@ variable default (in brackets); the variable is what hooks and subprocesses see.
 
 environment-only (machine configuration):
   CSANDBOX_BACKEND       bwrap | seatbelt (default by OS)
-  CSANDBOX_FINDINGS_DIR  where the findings tool lives (default: PATH, then ~/dev/findings)
-  CSANDBOX_FINDINGS_HOME findings store override (default: ~/.findings for the default
-                         tenant, <config>/findings for a named one)
 EOF
 }
 case "${1:-}" in -h|--help) usage; exit 0 ;; esac
@@ -204,8 +199,6 @@ while [ $# -gt 0 ]; do
     --root)          export CSANDBOX_ROOT="${2:-}" CSANDBOX_ROOT_SAVE=1; shift 2 2>/dev/null || shift ;;
     --udp)           export CSANDBOX_UDP="${2:-}"; shift 2 2>/dev/null || shift ;;
     --readonly)      export CSANDBOX_READONLY=1; shift ;;
-    --findings)      export CSANDBOX_FINDINGS=1 CSANDBOX_FINDINGS_EXPLICIT=1; shift ;;
-    --no-findings)   export CSANDBOX_FINDINGS=0; shift ;;
     --edit-gate)     export CSANDBOX_EDIT_GATE=1; shift ;;
     --shell)         export CSANDBOX_SHELL=1; shift ;;
     --dry-run)       export CSANDBOX_DRYRUN=1; shift ;;
@@ -214,8 +207,6 @@ while [ $# -gt 0 ]; do
 done
 set -- "${ARGS[@]+"${ARGS[@]}"}"
 
-FINDINGS="${CSANDBOX_FINDINGS:-1}"     # external memory: on by default
-FINDINGS_EXPLICIT="${CSANDBOX_FINDINGS_EXPLICIT:-0}"   # warn about a missing tool only when asked for explicitly
 TENANT="${CSANDBOX_TENANT:-}"
 UDP="${CSANDBOX_UDP:-}"                # UDP opt-in: "" (blocked) | local | open
 case "$UDP" in
@@ -240,7 +231,7 @@ EDIT_GATE="${CSANDBOX_EDIT_GATE:-0}"   # OPT-IN PreToolUse fact-forcing gate on 
 # (account/org ids), settings, sessions, the cached server-managed org policy -
 # and under bwrap the host ~/.claude isn't even mounted, so tenants can't see
 # each other. Everything else (workspace, slice + nft rule, wrapper scripts,
-# the findings store) is per USER and shared.
+# the config dir) is per USER and shared.
 #   --tenant <name> / CSANDBOX_TENANT=<name>   -> ~/.claude-sandbox-<name>
 #   CSANDBOX_CONFIG_DIR=<dir>                   -> that dir (wins over --tenant)
 #   neither                                     -> ~/.claude-sandbox (the default tenant)
@@ -402,16 +393,11 @@ CONFIG_IN="$CONFIG_DIR"
 add_mount rw "$CONFIG_DIR" "$CONFIG_IN"
 add_mount rw "$SCRATCH_DIR" "$SCRATCH_IN"
 
-CSANDBOX_MANIFEST=""
 CSANDBOX_SNAPSHOT=""
 # Set only when the session id is known up front (fresh mint, or
 # --resume/--session-id); a --continue/picker run has no id yet.
 if [ -n "$SESSION_ID" ]; then
   mkdir -p "$SCRATCH_DIR/sessions/$SESSION_ID"
-  # every worktree created this session (top-level or subagent) is appended here
-  # by the post-checkout hook - path/branch/fork_sha, one line per worktree -
-  # since the sandboxed process can't write host-side state directly.
-  CSANDBOX_MANIFEST="$SCRATCH_IN/sessions/$SESSION_ID/worktrees.jsonl"
   # Freeze every repo state under ROOT at spawn (branch + sha). Agents work off
   # this snapshot so concurrent host-side checkouts/commits can't disturb a
   # running session; csbox-enter-repo worktrees a repo pinned to its snapshot,
@@ -435,31 +421,6 @@ with ThreadPoolExecutor(max_workers=8) as ex:
     d = dict(x for x in ex.map(snap, repos) if x)
 json.dump(d, open(out, 'w'))
 PY
-fi
-
-# Detect the host linker (mounted in further down). Resolved here so the CLAUDE.md
-# guidance below is only seeded when linked-dep support is actually active.
-LINKER_DIR=""
-LINKER_CLI="$(command -v linker 2>/dev/null || true)"
-if [ -n "$LINKER_CLI" ]; then
-  _ld="$(dirname "$(resolve "$LINKER_CLI")")"
-  [ -f "$_ld/cli.js" ] && LINKER_DIR="$_ld"
-fi
-
-# Detect the host findings tool (external queryable memory; ON BY DEFAULT,
-# --no-findings to disable). Like linker, an unpublished host tool mounted in
-# rather than baked into the image. If it isn't installed we silently skip
-# (findings just isn't active that run) unless the user explicitly asked.
-FINDINGS_DIR=""
-if [ "$FINDINGS" = 1 ]; then
-  _fcli="$(command -v findings 2>/dev/null || true)"
-  if [ -n "$_fcli" ]; then
-    _fd="$(dirname "$(resolve "$_fcli")")"
-    [ -f "$_fd/cli.js" ] && FINDINGS_DIR="$_fd"
-  fi
-  _fdefault="${CSANDBOX_FINDINGS_DIR:-$HOME/dev/findings}"
-  [ -z "$FINDINGS_DIR" ] && [ -f "$_fdefault/cli.js" ] && FINDINGS_DIR="$_fdefault"
-  [ -z "$FINDINGS_DIR" ] && [ "$FINDINGS_EXPLICIT" = 1 ] && echo "csandbox: --findings set but the findings tool wasn't found (npm link it, or set CSANDBOX_FINDINGS_DIR)" >&2
 fi
 
 if [ ! -f "$CONFIG_DIR/CLAUDE.md" ] || ! grep -q '^# Scratch directory$' "$CONFIG_DIR/CLAUDE.md"; then
@@ -580,20 +541,6 @@ any host-side checkouts or commits since. Subagents share the same per-repo
 worktree automatically.
 EOF
 fi
-if [ -n "$LINKER_DIR" ] && ! grep -q 'Linked local dependencies' "$CONFIG_DIR/CLAUDE.md" 2>/dev/null; then
-  cat >> "$CONFIG_DIR/CLAUDE.md" <<'EOF'
-
-# Linked local dependencies
-If a repo has a `links.json`, its local-dependency links are wired up
-AUTOMATICALLY when its worktree is created (`linker load`, run by the same hook
-that hydrates node_modules): each linked dep becomes a worktree pinned to the
-sha in links.json, isolated to this worktree's branch, and symlinked into
-node_modules. So do NOT run `npm link` or hand-symlink local deps - it's already
-done and isolated. To add or re-pin a link, edit the dep and run `linker pin` in
-the repo (updates links.json, which you then commit). Run `linker check` to
-flag any stray node_modules symlink that isn't declared in links.json.
-EOF
-fi
 
 # Each tenant has its own login (token chain lives in its config dir), rather
 # than a copy of the host credentials: OAuth refresh tokens rotate, so a seeded
@@ -683,7 +630,13 @@ perms['additionalDirectories'] = [root, scratch_in]
 # EnterWorktree (stock behavior: only when the user asks for a worktree)
 # branches from the current commit rather than the default branch. setdefault so this is only a seeded default - a user customization is
 # left untouched.
-d.setdefault('worktree', {}).setdefault('baseRef', 'head')
+w = d.setdefault('worktree', {})
+w.setdefault('baseRef', 'head')
+# Share node_modules with the main checkout instead of copying it per worktree:
+# npm egress is blocked in here, so a fresh worktree would otherwise have no
+# deps at all. Replaces the old wt-hydrate git hook, whose `cp --reflink=auto`
+# is GNU-only and degraded to a full 300-500MB copy per worktree on macOS.
+w.setdefault('symlinkDirectories', ['node_modules'])
 with open(path, 'w') as f:
     json.dump(d, f, indent=2)
 EOF
@@ -693,92 +646,35 @@ if [ -f "$HOME/.gitconfig" ]; then
   add_mount ro "$HOME/.gitconfig" "$HOME_IN/.gitconfig"
 fi
 
-# --- linker: declarative local-dev linking ------------------------------
-# linker wires a repo's node_modules to worktrees of its local deps, pinned by
-# sha (links.json), applied per-worktree by the post-checkout hook. It's an
-# unpublished host tool (detected above), so we mount it in rather than bake it
-# into the image: its package dir at /opt/linker, a tiny wrapper on PATH, and
-# the host registry (name->path). Host paths are valid in-container because the
-# workspace mounts at the same path.
-if [ -n "$LINKER_DIR" ]; then
-  LINKER_WRAPPER="$LOCAL_SHARE_DIR/linker-wrapper"
-  printf '#!/bin/sh\nexec node /opt/linker/cli.js "$@"\n' > "$LINKER_WRAPPER"
-  chmod +x "$LINKER_WRAPPER"
-  add_mount ro "$LINKER_DIR" /opt/linker
-  add_mount ro "$LINKER_WRAPPER" "$BIN_IN/linker"
-  [ -f "$HOME/.linker/registry.json" ] \
-    && add_mount ro "$HOME/.linker/registry.json" "$HOME_IN/.linker/registry.json"
-fi
-
-# --- findings: external queryable memory (on by default; --no-findings) -----
-# Same mount-not-bake approach as linker: the CLI at /opt/findings + a wrapper on
-# PATH, plus a READ-WRITE ~/.findings store shared across sessions (the SQLite DB
-# and the telemetry trace). FINDINGS_EVENTS logs a recall/record trace so miss-rate
-# is measurable. Active whenever the tool was detected; --no-findings opts out.
-FINDINGS_EVENTS=""
-HOOKS_IN=""
-if [ -n "$FINDINGS_DIR" ]; then
-  FINDINGS_WRAPPER="$LOCAL_SHARE_DIR/findings-wrapper"
-  printf '#!/bin/sh\nexec node /opt/findings/cli.js "$@"\n' > "$FINDINGS_WRAPPER"
-  chmod +x "$FINDINGS_WRAPPER"
-  # The store is ACCOUNT state - what one account's sessions learned must not
-  # leak into another's - so it lives with the tenant: <config>/findings for a
-  # named or explicit tenant (inside the config-dir mount, nothing extra to
-  # bind), and the pre-existing ~/.findings for the default tenant (also the
-  # host-side CLI's default, so `findings recall` on the host keeps working).
-  # CSANDBOX_FINDINGS_HOME overrides - pointing two tenants at one dir is how
-  # you share deliberately.
-  if [ -n "${CSANDBOX_FINDINGS_HOME:-}" ]; then FINDINGS_HOME="$CSANDBOX_FINDINGS_HOME"
-  elif [ "$DEFAULT_TENANT" = 1 ]; then FINDINGS_HOME="$HOME/.findings"
-  else FINDINGS_HOME="$CONFIG_DIR/findings"; fi
-  mkdir -p "$FINDINGS_HOME"
-  add_mount ro "$FINDINGS_DIR" /opt/findings
-  add_mount ro "$FINDINGS_WRAPPER" "$BIN_IN/findings"
-  case "$FINDINGS_HOME" in
-    "$CONFIG_DIR"/*) ;;                                    # already inside the config-dir mount
-    *) add_mount rw "$FINDINGS_HOME" "$FINDINGS_HOME" ;;  # rw: store + telemetry trace (same path inside)
-  esac
-  FINDINGS_EVENTS="$FINDINGS_HOME/events.jsonl"
-  # Hook scripts (claude-hooks/): copied to the host-side share dir and mounted
-  # on PATH. Under bwrap they are reached at $BIN_IN/<name>; seatbelt applies no
-  # mounts, so it runs them at their host path.
-  #   memory-findings-nudge  PostToolUse(Edit|Write) - nudges the agent to also
-  #                          findings-record its own auto-memory writes
-  #   findings-hook prompt   UserPromptSubmit - auto-recall: injects the claims
-  #                          matching the prompt (closes the "never recalls" gap)
-  #   findings-hook stop     Stop - one-shot "record before you finish" nudge for
-  #                          a substantial session that recorded nothing
-  #   findings-hook compact  SessionStart(compact) - re-injects the claims shown
-  #                          before compaction + a record nudge
-  # Every findings script exits 0 silently unless FINDINGS_DB is set (only when
-  # this block ran), so a stale registration can never break a --no-findings run.
-fi
+# Hook scripts (claude-hooks/): copied to the host-side share dir and mounted
+# on PATH. Under bwrap they are reached at $BIN_IN/<name>; seatbelt applies no
+# mounts, so it runs them at their host path.
 # All hook scripts are mounted regardless; registration below decides which
-# are active. edit-gate (PreToolUse Edit|Write) is independent of findings: it
+# are active. edit-gate (PreToolUse Edit|Write) is opt-in: it
 # blocks the FIRST edit to an existing source file once per session with a
 # fact request (importers across the workspace, affected exports, formats) -
 # see claude-hooks/edit-gate. OPT-IN via CSANDBOX_EDIT_GATE=1: with it on by
 # default, agents were seen taking the refusal as "done" and moving on to run
 # tests without the edit ever landing (2026-09-24), which is worse than the
 # importer blind spot it guards against.
-for _h in memory-findings-nudge findings-hook edit-gate; do
+for _h in edit-gate; do
   cp "$SANDBOX_DIR/claude-hooks/$_h" "$LOCAL_SHARE_DIR/$_h"
   chmod +x "$LOCAL_SHARE_DIR/$_h"
   add_mount ro "$LOCAL_SHARE_DIR/$_h" "$BIN_IN/$_h"
 done
 if [ "$BACKEND" = seatbelt ]; then HOOKS_IN="$LOCAL_SHARE_DIR"; else HOOKS_IN="$BIN_IN"; fi
 
-# Register (or, with findings inactive, remove) the findings hooks in the
+# Register (or, when inactive, remove) our hooks in the
 # persistent settings.json. Idempotent by command string: this runs on every
 # launch and settings.json persists across them, so a plain append would
 # duplicate entries every session. Matching is on our own script names, so
 # user-added hooks on the same events are left alone.
-python3 - "$CONFIG_DIR/settings.json" "$HOOKS_IN" "${FINDINGS_DIR:+1}" "$EDIT_GATE" <<'EOF'
+python3 - "$CONFIG_DIR/settings.json" "$HOOKS_IN" "$EDIT_GATE" <<'EOF'
 import json, sys
-path, hooks_in, findings, edit_gate = sys.argv[1], sys.argv[2], sys.argv[3] == '1', sys.argv[4] == '1'
+path, hooks_in, edit_gate = sys.argv[1], sys.argv[2], sys.argv[3] == '1'
 with open(path) as f:
     d = json.load(f)
-OURS = ('memory-findings-nudge', 'findings-hook', 'edit-gate')
+OURS = ('memory-findings-nudge', 'findings-hook', 'edit-gate')  # legacy names kept: still strips stale registrations
 def is_ours(h):
     return any(('/' + n + ' ') in h.get('command', '') + ' ' for n in OURS)
 hooks = d.setdefault('hooks', {})
@@ -795,13 +691,6 @@ for ev in list(hooks):
     else:
         del hooks[ev]
 want = []
-if findings:
-    want += [
-        ('PostToolUse',      'Edit|Write', f'{hooks_in}/memory-findings-nudge', None),
-        ('UserPromptSubmit', None,         f'{hooks_in}/findings-hook prompt',  20),
-        ('Stop',             None,         f'{hooks_in}/findings-hook stop',    15),
-        ('SessionStart',     'compact',    f'{hooks_in}/findings-hook compact', 15),
-    ]
 if edit_gate:
     want += [('PreToolUse', 'Edit|Write', f'{hooks_in}/edit-gate', 10)]
 if True:
@@ -825,20 +714,14 @@ EOF
 # them as user skills (`/name`, or the model loads them by description). Copy,
 # not mount, so a skill edited on the host lands on the next launch and the
 # agent can't write back into this repo. Only our names are replaced; anything
-# else under skills/ (synced, user-added) is left alone. The findings skill is
-# installed the same way when the tool is active.
+# else under skills/ (synced, user-added) is left alone.
 mkdir -p "$CONFIG_DIR/skills"
 for _s in "$SANDBOX_DIR"/skills/*/; do
   _n="$(basename "$_s")"
   rm -rf "$CONFIG_DIR/skills/$_n"
   cp -r "$_s" "$CONFIG_DIR/skills/$_n"
 done
-if [ -n "$FINDINGS_DIR" ] && [ -f "$FINDINGS_DIR/skills/findings.md" ]; then
-  rm -rf "$CONFIG_DIR/skills/findings"; mkdir -p "$CONFIG_DIR/skills/findings"
-  cp "$FINDINGS_DIR/skills/findings.md" "$CONFIG_DIR/skills/findings/SKILL.md"
-else
-  rm -rf "$CONFIG_DIR/skills/findings"
-fi
+rm -rf "$CONFIG_DIR/skills/findings"   # stale install from the removed findings integration
 
 # --- secret scrubbing -------------------------------------------------
 # Shadow known secret-shaped files under the mounted root with an empty
@@ -937,12 +820,16 @@ if [ "${CSANDBOX_SHELL:-}" = "1" ]; then
   CMD=(bash)
 else
   CLAUDE_ENV=(IS_SANDBOX=1 "DISABLE_AUTOUPDATER=1")
-  [ -n "$CSANDBOX_MANIFEST" ] && CLAUDE_ENV+=("CSANDBOX_MANIFEST=$CSANDBOX_MANIFEST")
   CLAUDE_ENV+=("CSANDBOX_SCRATCH=$SCRATCH_IN")
   # bwrap injects CLAUDE_CONFIG_DIR via --setenv at launch; the seatbelt backend
   # runs claude with the plain env, so it must be set here or claude reads the
   # default ~/.claude instead of the sandbox config we populated.
-  [ "$BACKEND" = seatbelt ] && CLAUDE_ENV+=("CLAUDE_CONFIG_DIR=$CONFIG_IN")
+  if [ "$BACKEND" = seatbelt ]; then
+    CLAUDE_ENV+=("CLAUDE_CONFIG_DIR=$CONFIG_IN")
+    # bwrap binds our bin/ into /opt and sets PATH via --setenv; seatbelt
+    # relocates nothing, so point PATH at it in place.
+    CLAUDE_ENV+=("PATH=$SANDBOX_DIR/bin:$PATH")
+  fi
   # CSANDBOX_SESSION_ID + CSANDBOX_SNAPSHOT are inherited by subagents, so they
   # share this session's frozen snapshot and per-repo worktrees.
   [ -n "$CSANDBOX_SNAPSHOT" ] && CLAUDE_ENV+=("CSANDBOX_SNAPSHOT=$CSANDBOX_SNAPSHOT" "CSANDBOX_SESSION_ID=$SESSION_ID")
@@ -951,16 +838,6 @@ else
   CLAUDE_ENV+=("CSANDBOX_HOOK_STATE=$SCRATCH_IN/sessions/${SESSION_ID:-nosession}/hook-state" "CSANDBOX_EDIT_GATE=$EDIT_GATE" "CSANDBOX_ROOT=$ROOT")
   CLAUDE_ARGS=(--dangerously-skip-permissions)
   [ ${#MINT_SESSION_ARGS[@]} -gt 0 ] && CLAUDE_ARGS+=("${MINT_SESSION_ARGS[@]}")
-  if [ -n "$FINDINGS_DIR" ]; then
-    CLAUDE_ENV+=("FINDINGS_DB=$FINDINGS_HOME/findings.db" "FINDINGS_EVENTS=$FINDINGS_EVENTS")
-    [ -n "$SESSION_ID" ] && CLAUDE_ENV+=("FINDINGS_SESSION=$SESSION_ID")
-    # The guide lives at the mounted /opt path under bwrap, but at its real host
-    # path under seatbelt (which doesn't relocate the filesystem).
-    if [ "$BACKEND" = seatbelt ]; then FINDINGS_GUIDE="$FINDINGS_DIR/skills/findings.md"; else FINDINGS_GUIDE="/opt/findings/skills/findings.md"; fi
-    # ephemeral (per-run) guidance - NOT written to the persistent CLAUDE.md, so
-    # it never leaks into non --findings runs.
-    CLAUDE_ARGS+=(--append-system-prompt "An external 'findings' memory (a shared cross-session store) is available this session. Before investigating anything non-trivial, run 'findings recall <terms>' first - a past session may have already worked it out. When you learn something durable that isn't obvious from the code (a mechanism or gotcha, a decision and why, or a fact about the user/environment), record it with 'findings record'. Full usage guide: $FINDINGS_GUIDE. This is opt-in test tooling - use it alongside your normal workflow.")
-  fi
   # bwrap routes egress through the loopback node proxy (nft-confined); seatbelt
   # uses Claude Code's built-in sandbox proxy instead, so no HTTP_PROXY here.
   if [ "$BACKEND" = bwrap ]; then
@@ -987,8 +864,6 @@ case "$UDP" in
   local) echo "csandbox: UDP local - loopback only, DNS (port 53) still blocked" ;;
   open)  echo "csandbox: UDP OPEN - all outbound UDP allowed; it bypasses the proxy and the hostname allowlist" ;;
 esac
-[ -n "$LINKER_DIR" ] && echo "csandbox: linker -> $LINKER_DIR (declarative local links wired per-worktree)"
-[ -n "$FINDINGS_DIR" ] && echo "csandbox: findings -> $FINDINGS_DIR (store $FINDINGS_HOME, telemetry on; --no-findings to disable)"
 
 # dry run: show resolved config and stop before launching the backend
 if [ "${CSANDBOX_DRYRUN:-}" = "1" ]; then
@@ -1041,7 +916,7 @@ launch_bwrap() {
             --ro-bind /etc /etc --proc /proc --dev /dev --tmpfs /tmp)
 
   # node/npm + the claude CLI live under $HOME (nvm / ~/.local), not /usr -
-  # bind just those, read-only (mount-not-bake, same spirit as linker/findings
+  # bind just those, read-only (mount-not-bake
   # above). This is what lets the bwrap path skip a build step entirely.
   # The whole node prefix, not just bin/: npm itself and every global's bin
   # entry are symlinks into <prefix>/lib/node_modules. Globals that are
@@ -1054,20 +929,9 @@ launch_bwrap() {
   bw+=(--ro-bind-try "$HOME/.local/bin" "$HOME/.local/bin")
   bw+=(--ro-bind-try "$HOME/.local/share/claude" "$HOME/.local/share/claude")
 
-  # git-hooks: sets a system-wide `core.hooksPath` via GIT_CONFIG_SYSTEM (git
-  # 2.32+) instead of writing into /etc - /etc is bound straight from the
-  # real host read-only, and it's root-owned
-  # there, so even a "rw" bind can't create a new /etc/gitconfig on top of it
-  # (bind mount options don't override the underlying directory's real DAC
-  # permissions). Pointing git at our own file entirely sidesteps that.
-  local gitconfig="$CONFIG_DIR/bwrap-etc-gitconfig"
-  printf '[core]\n\thooksPath = /opt/csandbox-tools/share/git-hooks\n' > "$gitconfig"
-  bw+=(--setenv GIT_CONFIG_SYSTEM "$gitconfig")
-  bw+=(--ro-bind "$SANDBOX_DIR/git-hooks" /opt/csandbox-tools/share/git-hooks)
-  bw+=(--ro-bind "$SANDBOX_DIR/git-hooks/wt-hydrate" "$BIN_IN/wt-hydrate")
-  bw+=(--ro-bind "$SANDBOX_DIR/git-hooks/csbox-enter-repo" "$BIN_IN/csbox-enter-repo")
+  bw+=(--ro-bind "$SANDBOX_DIR/bin/csbox-enter-repo" "$BIN_IN/csbox-enter-repo")
 
-  # everything else: workspace/config/scratch/linker/findings/secret-shadows
+  # everything else: workspace/config/scratch/secret-shadows
   local i
   for i in "${!MOUNT_SRC[@]}"; do
     if [ "${MOUNT_MODE[$i]}" = ro ]; then
