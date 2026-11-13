@@ -12,6 +12,7 @@ Sessions bucket by escaped-cwd under <config>/projects/, so the built-in
 
   csbox-sessions rebuild            rescan transcripts (incremental by mtime)
   csbox-sessions list [-a] [query]  print the index (tab-separated)
+                                    (list/pick/resume auto-refresh; --no-rebuild skips)
   csbox-sessions pick [query]       fzf picker -> prints the chosen session id
   csbox-sessions resume [query]     pick, then exec `claude --resume <id>`
   csbox-sessions protect <id>...    mark keep-forever (also pins it in --all)
@@ -164,7 +165,7 @@ def live_session_ids():
             live.add(sid)
     return live
 
-def cmd_rebuild(argv):
+def cmd_rebuild(argv, quiet=False):
     full = '--full' in argv
     c = db()
     seen, new, upd = set(), 0, 0
@@ -195,6 +196,8 @@ def cmd_rebuild(argv):
     for sid in gone:
         c.execute('DELETE FROM session WHERE id=?', (sid,))
     c.commit()
+    if quiet:
+        return
     total = c.execute('SELECT COUNT(*) FROM session').fetchone()[0]
     print(f'indexed {len(seen)} transcript(s) across {len(config_dirs())} config dir(s); '
           f'{new} written, {len(gone)} stale row(s) dropped; {total} in index')
@@ -222,13 +225,23 @@ def rows(query=None, show_all=True):
         out.append((sid, line))
     return out
 
+def refresh(argv):
+    if '--no-rebuild' in argv:
+        return
+    try:
+        cmd_rebuild([], quiet=True)
+    except Exception:
+        pass   # a broken index must never block the picker
+
 def cmd_list(argv):
+    refresh(argv)
     show_all = '-a' in argv or '--all' in argv
     q = ' '.join(a for a in argv if not a.startswith('-')) or None
     for sid, line in rows(q, show_all=show_all):
         print(f'{sid}\t{line}')
 
 def cmd_pick(argv):
+    refresh(argv)
     if not shutil.which('fzf'):
         sys.exit('csbox-sessions: fzf not found (brew install fzf)')
     show_all = '-a' in argv or '--all' in argv
