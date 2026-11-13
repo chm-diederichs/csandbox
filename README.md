@@ -182,12 +182,13 @@ claude-sandbox/
 ├── README.md            # this file
 ├── csandbox             # the launcher (symlinked into ~/.local/bin)
 ├── bwrap-setup          # one-time root setup (AppArmor profile, slice, nft rule)
+├── docs/DESIGN.md       # architecture, decision log, what was removed and why
 ├── bin/
 │   └── csbox-enter-repo # worktree a repo pinned to this session's snapshot
 ├── csbox-sessions       # searchable index over session transcripts (fzf picker)
 ├── claude-hooks/        # Claude Code lifecycle hooks, mounted + registered per launch
 │   ├── edit-gate              # PreToolUse (opt-in, CSANDBOX_EDIT_GATE=1): first edit asks for importers/exports/formats once
-├── skills/              # harness-level skills, copied into the sandbox config each launch (docs/skills.md)
+├── skills/              # harness-level skills, copied into the sandbox config each launch (docs/DESIGN.md)
 │   ├── autonomous-preflight/  # goal/done/boundary block before any unattended run or fan-out
 │   ├── strict-review/         # reviewer brief: cite line + trigger or drop the finding
 │   ├── hunt-silent-failures/  # swallowed errors, streams/emitters that drop them
@@ -307,7 +308,7 @@ surfaces don't collide). An opt-in edit gate (`CSANDBOX_EDIT_GATE=1`) adds a
 per session until the agent lists the module's importers across the workspace,
 the exports it touches and any formats involved. It is off by default: agents
 were observed treating the refusal as done and moving on without the edit. How
-skills are written, placed and tested: `docs/skills.md`.
+skills are written, placed and tested: `docs/DESIGN.md`.
 
 ---
 
