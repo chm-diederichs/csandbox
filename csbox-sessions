@@ -14,6 +14,8 @@ Sessions bucket by escaped-cwd under <config>/projects/, so the built-in
   csbox-sessions list [-a] [query]  print the index (tab-separated)
                                     (list/pick/resume auto-refresh; --no-rebuild skips)
   csbox-sessions pick [query]       fzf picker -> prints the chosen session id
+        --fields                    print 'id<TAB>cwd' instead of just the id
+        --config-dir DIR            only sessions from that config dir
   csbox-sessions resume [query]     pick, then exec `claude --resume <id>`
   csbox-sessions protect <id>...    mark keep-forever (also pins it in --all)
   csbox-sessions unprotect <id>...
@@ -48,6 +50,7 @@ CREATE TABLE IF NOT EXISTS session (
   title        TEXT,     -- Claude Code's own ai-title, free
   first_prompt TEXT,
   last_prompt  TEXT,
+  cwd          TEXT,     -- last cwd seen; where a resume should land
   repos        TEXT,     -- distinct git roots touched, comma-joined
   branches     TEXT,
   messages     INTEGER,  -- user+assistant records
@@ -66,6 +69,10 @@ def db():
     os.makedirs(os.path.dirname(DB), exist_ok=True)
     c = sqlite3.connect(DB)
     c.executescript(SCHEMA)
+    have = {r[1] for r in c.execute('PRAGMA table_info(session)')}
+    for col, decl in (('cwd', 'TEXT'),):          # migrate an index built before this column
+        if col not in have:
+            c.execute(f'ALTER TABLE session ADD COLUMN {col} {decl}')
     return c
 
 def git_root(path, _cache={}):
@@ -98,7 +105,7 @@ def text_of(msg):
 
 def scan(path):
     """Derive every non-durable field from one transcript."""
-    started = ended = title = first_prompt = last_prompt = None
+    started = ended = title = first_prompt = last_prompt = last_cwd = None
     cwds, branches = set(), set()
     messages = commits = 0
     compacted = False
@@ -113,7 +120,7 @@ def scan(path):
                 started = started or d['timestamp']
                 ended = d['timestamp']
             if d.get('cwd'):
-                cwds.add(d['cwd'])
+                cwds.add(d['cwd']); last_cwd = d['cwd']
             if d.get('gitBranch'):
                 branches.add(d['gitBranch'])
             if t == 'ai-title' and d.get('aiTitle'):
@@ -136,7 +143,7 @@ def scan(path):
             if d.get('isCompactSummary') or t == 'compact-summary':
                 compacted = True
     repos = sorted({git_root(c) for c in cwds})
-    return dict(started=started, ended=ended, title=title,
+    return dict(started=started, ended=ended, title=title, cwd=last_cwd,
                 first_prompt=(first_prompt or '')[:400],
                 last_prompt=(last_prompt or '')[:400],
                 repos=','.join(os.path.basename(r) for r in repos),
@@ -202,16 +209,21 @@ def cmd_rebuild(argv, quiet=False):
     print(f'indexed {len(seen)} transcript(s) across {len(config_dirs())} config dir(s); '
           f'{new} written, {len(gone)} stale row(s) dropped; {total} in index')
 
-def rows(query=None, show_all=True):
+def rows(query=None, show_all=True, config_dir=None):
     c = db()
-    sql = 'SELECT id, ended, title, first_prompt, last_prompt, repos, branches, messages, commits, protected, note FROM session'
-    args = []
+    sql = ('SELECT id, ended, title, first_prompt, last_prompt, repos, branches, '
+           'messages, commits, protected, note, cwd FROM session')
+    where, args = [], []
     if not show_all:
-        sql += ' WHERE protected=1 OR ended >= date("now","-30 days")'
+        where.append('(protected=1 OR ended >= date("now","-30 days"))')
+    if config_dir:
+        where.append('config_dir=?'); args.append(config_dir)
+    if where:
+        sql += ' WHERE ' + ' AND '.join(where)
     sql += ' ORDER BY protected DESC, ended DESC'
     out = []
     for r in c.execute(sql, args):
-        (sid, ended, title, fp, lp, repos, branches, msgs, commits, prot, note) = r
+        (sid, ended, title, fp, lp, repos, branches, msgs, commits, prot, note, cwd) = r
         label = title or (fp or '')[:60] or '(empty)'
         when = (ended or '')[:16].replace('T', ' ')
         mark = '*' if prot else ' '
@@ -222,7 +234,7 @@ def rows(query=None, show_all=True):
             line += f'  # {note}'
         if query and query.lower() not in (line + ' ' + (lp or '')).lower():
             continue
-        out.append((sid, line))
+        out.append((sid, line, cwd or ''))
     return out
 
 def refresh(argv):
@@ -236,28 +248,46 @@ def refresh(argv):
 def cmd_list(argv):
     refresh(argv)
     show_all = '-a' in argv or '--all' in argv
-    q = ' '.join(a for a in argv if not a.startswith('-')) or None
-    for sid, line in rows(q, show_all=show_all):
+    cfg = opt(argv, '--config-dir')
+    skip = {'--config-dir', cfg} if cfg else set()
+    q = ' '.join(a for a in argv if not a.startswith('-') and a not in skip) or None
+    for sid, line, cwd in rows(q, show_all=show_all, config_dir=cfg):
         print(f'{sid}\t{line}')
+
+def opt(argv, name):
+    """--name VALUE -> VALUE, else None."""
+    if name in argv:
+        i = argv.index(name)
+        if i + 1 < len(argv):
+            return argv[i + 1]
+    return None
 
 def cmd_pick(argv):
     refresh(argv)
     if not shutil.which('fzf'):
         sys.exit('csbox-sessions: fzf not found (brew install fzf)')
     show_all = '-a' in argv or '--all' in argv
-    q = ' '.join(a for a in argv if not a.startswith('-'))
-    data = rows(None, show_all=show_all)
+    cfg = opt(argv, '--config-dir')
+    skip = {'--config-dir', cfg} if cfg else set()
+    q = ' '.join(a for a in argv if not a.startswith('-') and a not in skip)
+    data = rows(None, show_all=show_all, config_dir=cfg)
     if not data:
-        sys.exit('csbox-sessions: no sessions indexed (run: csbox-sessions rebuild)')
-    feed = ''.join(f'{sid}\t{line}\n' for sid, line in data)
+        sys.exit('csbox-sessions: no sessions indexed for this config dir')
+    feed = ''.join(f'{sid}\t{line}\n' for sid, line, _ in data)
     r = subprocess.run(
         ['fzf', '--delimiter=\t', '--with-nth=2..', '--no-sort',
          '--height=60%', '--reverse', '--query', q,
+         '--select-1', '--exit-0',   # unambiguous query -> no keypress needed
          '--prompt=session> ', '--preview-window=hidden'],
         input=feed, capture_output=True, text=True)
     if r.returncode != 0 or not r.stdout.strip():
         sys.exit(1)
-    print(r.stdout.split('\t', 1)[0])
+    sid = r.stdout.split('\t', 1)[0]
+    if '--fields' in argv:   # id + cwd, for csandbox to resume into the right project dir
+        cwd = next((c for i, _, c in data if i == sid), '')
+        print(f'{sid}\t{cwd}')
+    else:
+        print(sid)
 
 def cmd_resume(argv):
     import io

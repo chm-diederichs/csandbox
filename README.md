@@ -25,6 +25,8 @@ csandbox                       # sandbox the current directory (minimal egress)
 csandbox ~/code/myapp          # sandbox a specific project
 csandbox . --continue          # unknown args are passed to `claude`
 csandbox --profile dev .       # allow npm + git + pypi for this session
+csandbox                       # no args: pick a session to resume (fzf), in its own project dir
+csandbox -n                    # straight to a new session in the current dir
 csandbox --tenant work .       # a second Claude account: own config dir, login, proxy port
 csandbox --help                # every flag, and the env var each one defaults from
 ```
@@ -157,6 +159,7 @@ prints the same table.
 | `--allow <host[,host]>`   | `CSANDBOX_EXTRA_DOMAINS`  | Extra hosts to allow on top of the profile(s); repeatable.                              |
 | `--udp <local\|open>`     | `CSANDBOX_UDP`            | Allow UDP: `local` = loopback minus DNS, `open` = all outbound. bwrap only.             |
 | `--root <dir>`            | `CSANDBOX_ROOT`           | Workspace root to mount; **remembered per tenant** in `<config>/root` and applied to every later run of that tenant (delete the file to forget). Default: `~/hyper` when the project is under it, else the project dir. A run started outside the root with no project dir lands at the root. |
+| `-n`, `--new`            | —                         | New session; skip the picker that bare `csandbox` opens. |
 | `--readonly`              | `CSANDBOX_READONLY=1`     | Mount the workspace read-only.                                                          |
 | `--tenant <name>`         | `CSANDBOX_TENANT`         | Second Claude account: config dir `~/.claude-sandbox-<name>`, own login and proxy port. |
 | `--config-dir <dir>`      | `CSANDBOX_CONFIG_DIR`     | Explicit config dir (wins over the tenant name). Pair with `--proxy-port`.              |
