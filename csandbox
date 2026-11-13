@@ -1113,11 +1113,17 @@ launch_seatbelt() {
   #   permissions.deny     - Read() rules so Claude's OWN Read/Grep tools (which
   #                          run unsandboxed) also can't read the secret list
   #
-  # Strict is mandatory, not cosmetic: allowUnsandboxedCommands=false. With
-  # Bash(*) allowed (added by the shared settings patch to kill prompts), a
-  # command hitting a non-allowed domain would otherwise fall back to the
-  # permission flow and be auto-approved UNSANDBOXED - escaping the egress
-  # boundary. Strict mode makes such a command fail instead.
+  # THREE settings make the egress boundary real; all are load-bearing:
+  #   allowUnsandboxedCommands=false - no dangerouslyDisableSandbox escape.
+  #   network.strictAllowlist=true   - a non-allowed host is DENIED, not
+  #     prompted. Without it the runtime prompts, and since the shared settings
+  #     patch adds Bash(*) to permissions.allow to kill prompts, that prompt is
+  #     auto-approved and the request goes through. Measured 2026-11-13: with
+  #     only the first setting, curl https://github.com returned 200 from inside
+  #     the sandbox while the filesystem fence held - egress was never enforced.
+  #   failIfUnavailable=true         - if the sandbox cannot start, exit instead
+  #     of printing a warning and running every command unsandboxed (the
+  #     documented default is to degrade silently).
   python3 - "$CONFIG_DIR/settings.json" "$ROOT" "$SCRATCH_IN" "$MOUNT_NOTE" \
       "$ALLOWED_DOMAINS" \
       "$(printf '%s\n' "${HOME_SECRETS[@]}" ${SECRET_FILES[@]+"${SECRET_FILES[@]}"})" <<'PY'
@@ -1141,9 +1147,10 @@ if secrets:
 
 d["sandbox"] = {
     "enabled": True,
+    "failIfUnavailable": True,           # never silently degrade to unsandboxed
     "autoAllowBashIfSandboxed": True,
     "allowUnsandboxedCommands": False,   # strict: no unsandboxed escape (see above)
-    "network": {"allowedDomains": domains},
+    "network": {"allowedDomains": domains, "strictAllowlist": True},
     "filesystem": fs,
 }
 
